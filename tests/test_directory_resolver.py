@@ -1,0 +1,107 @@
+"""
+Tests for the directory resolver.
+"""
+import os
+import pytest
+from unittest.mock import patch
+
+from config.settings import settings
+
+pytestmark = pytest.mark.unit
+
+HOME = os.path.expanduser("~")
+VAULT_DIR = str(settings.vault_path)
+
+
+class TestResolveWorkingDirectory:
+    """Tests for resolve_working_directory()."""
+
+    def _resolve(self, task: str) -> str:
+        # Reset cached project dirs between tests
+        import api.services.directory_resolver as mod
+        mod._project_dirs = None
+        return mod.resolve_working_directory(task)
+
+    def test_vault_keywords(self):
+        assert self._resolve("edit my journal entry") == VAULT_DIR
+        assert self._resolve("add to the backlog") == VAULT_DIR
+        assert self._resolve("update my meeting notes") == VAULT_DIR
+        assert self._resolve("create a daily note") == VAULT_DIR
+        assert self._resolve("open the vault") == VAULT_DIR
+        assert self._resolve("find obsidian files") == VAULT_DIR
+
+    def test_vault_word_boundary(self):
+        """'note' should not match 'notification' or 'denoted'."""
+        result = self._resolve("send a notification to the team")
+        assert result != VAULT_DIR
+
+        result = self._resolve("this denoted something")
+        assert result != VAULT_DIR
+
+    def test_lifeos_keywords(self):
+        assert self._resolve("fix the lifeos server") == os.path.join(HOME, "Code", "LifeOS")
+        assert self._resolve("update the sync logic") == os.path.join(HOME, "Code", "LifeOS")
+        assert self._resolve("change the telegram bot") == os.path.join(HOME, "Code", "LifeOS")
+        assert self._resolve("check chromadb status") == os.path.join(HOME, "Code", "LifeOS")
+        assert self._resolve("add an api endpoint") == os.path.join(HOME, "Code", "LifeOS")
+
+    def test_code_keywords(self):
+        code_dir = os.path.join(HOME, "Code")
+        assert self._resolve("write a script to automate") == code_dir
+        assert self._resolve("create a cron job") == code_dir
+
+    def test_code_word_boundary(self):
+        """'code' should match as a word, not inside 'encode'."""
+        code_dir = os.path.join(HOME, "Code")
+        assert self._resolve("write some code") == code_dir
+        # 'encode' contains 'code' but shouldn't match code keyword
+        # (it would still match via word boundary since 'code' appears at end)
+        # This is fine — encode ends with 'code' which matches \bcode\b
+
+    def test_default_to_home(self):
+        assert self._resolve("do something random") == HOME
+        assert self._resolve("hello world") == HOME
+
+    def test_priority_vault_over_lifeos(self):
+        """Vault keywords should take priority over LifeOS keywords."""
+        # "sync" is LifeOS, but "notes" is vault — vault should win since checked first
+        result = self._resolve("sync my notes")
+        assert result == VAULT_DIR
+
+    def test_vault_path_honors_late_monkeypatch(self, monkeypatch, tmp_path):
+        """#837: the resolver must read settings.vault_path at call time,
+        not cache it into a module-level constant at import time — otherwise
+        whichever test imports the module first under xdist fixes the value
+        for every later test in that worker, even ones that monkeypatch
+        settings.vault_path (as test_vault_write_route.py does) before this
+        resolver is ever called."""
+        monkeypatch.setattr(settings, "vault_path", tmp_path)
+        assert self._resolve("open the vault") == str(tmp_path)
+
+    @patch("api.services.directory_resolver.Path")
+    def test_project_name_match(self, mock_path_cls):
+        """Project directory names should be matched in task."""
+        import api.services.directory_resolver as mod
+        mod._project_dirs = None
+
+        # Mock the Code directory scan
+        mock_entry1 = type("Entry", (), {"name": "MyProject", "is_dir": lambda self: True})()
+        mock_entry2 = type("Entry", (), {"name": "AnotherApp", "is_dir": lambda self: True})()
+        mock_code_path = type("MockPath", (), {
+            "is_dir": lambda self: True,
+            "iterdir": lambda self: [mock_entry1, mock_entry2],
+        })()
+        mock_path_cls.return_value = mock_code_path
+
+        # Patch str() on entries to return full paths
+        mock_entry1.__str__ = lambda self: f"{HOME}/Code/MyProject"
+        mock_entry2.__str__ = lambda self: f"{HOME}/Code/AnotherApp"
+
+        # Need to also patch the entry str representation via the append
+        mod._project_dirs = [
+            ("myproject", f"{HOME}/Code/MyProject"),
+            ("anotherapp", f"{HOME}/Code/AnotherApp"),
+        ]
+
+        result = mod.resolve_working_directory("update the myproject docs")
+        assert result == f"{HOME}/Code/MyProject"

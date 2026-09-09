@@ -1,0 +1,434 @@
+# Agent Activity Visualization (`/agents`)
+
+> **Status:** Complete
+> **Owner:** Agent Worker
+> **Last Updated:** 2026-09-08
+
+`/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab keeps the earlier force-directed session graph as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
+
+The point is one place to see what needs attention: what's waiting on an assignment, what an agent is stuck asking about, what's scheduled to run next, and — when you want to watch the machinery — what's actually executing right now.
+
+---
+
+## Table of Contents
+
+1. [Kanban board](#kanban-board)
+2. [Graph tab — what you see](#graph-tab--what-you-see)
+3. [Two sources, one graph](#two-sources-one-graph)
+4. [Graph tab — Status semantics](#graph-tab--status-semantics)
+5. [Graph tab — Filters and chips](#graph-tab--filters-and-chips)
+6. [Graph tab — Side panel](#graph-tab--side-panel)
+7. [Graph tab — Operator controls — kill](#graph-tab--operator-controls--kill)
+8. [Graph tab — Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)
+9. [Linking the board and the graph](#linking-the-board-and-the-graph)
+10. [Privacy and exposure](#privacy-and-exposure)
+11. [Configuration knobs](#configuration-knobs)
+12. [Related Documents](#related-documents)
+
+---
+
+## Kanban board
+
+The board is backed by the vault task store (`LifeOS/Tasks/`) — every card is a task, plus one card per upcoming scheduler entry. There is no separate "board" data file: a card's lane is always derived fresh from the task's status and tags, so editing a task from Obsidian, `/chat`, or a Telegram reply moves its card exactly as if it had been dragged.
+
+### Lanes
+
+| Lane | What lands here |
+|---|---|
+| **Unassigned** | An open task with no assignee tag. |
+| **Assigned** | An assignee tag is set (including `#me`) but work hasn't started. |
+| **In progress** | Status `in_progress`, or the agent worker's own `#agent-running` tag. |
+| **Human queue** | An agent is blocked on a question, or a `#human` card was filed for the operator, or the task's status is `blocked`. |
+| **Scheduled** | A scheduler entry (`docs/guides/scheduler.md`) with at least one future fire. |
+| **Review** | The agent worker's `#agent-completed` tag is set and the card hasn't been accepted yet. |
+| **Done** | Status `done` or `cancelled` (cancelled cards are hidden behind the "include cancelled" filter by default whenever the Done column is shown), plus scheduler entries that have fired (one-off) or been disabled (recurring). Hidden by default in the lane filter below — the least useful lane day to day. |
+
+Each lane header carries a small accent colour — the same palette the Graph tab uses for a node's fill, so a session's lane reads identically on both tabs.
+
+### Human moves on agent-owned cards
+
+A card is agent-owned once its assignee is `#claude`, `#codex`, `#hermes`, `#local`, or `#cloud`, OR the worker has already claimed it even with no assignee tag at all — the shape a legacy bare `#agent` queue card is left in. An agent-owned card is managed by the agent — dragging one is more restricted than dragging a `#me` or unassigned card, which can be dragged between every lane a human may drop a card into.
+
+- **Before the worker claims it** (no `#agent-running`/`#agent-blocked` tag yet, and no CLI session opened on it — see below), a human may still reassign it, unassign it, or Cancel it (see below). A drag straight to In progress is refused — only the worker claims agent-assigned tasks — and so is a drag to Human queue or Done: those lanes exist for the worker to ask a question, finish, or get accepted into, not for a human to silently close or re-route a card that's been handed to an agent.
+- **Once the worker claims it, OR a CLI session has been opened on it** (the drawer's **Open** action on an Assigned `#claude`/`#codex` card, before the worker itself ever adds `#agent-running`) — every drag is refused, and so is any change to the assignee, the Tags field, or the model/effort/host pickers in the drawer — each is disabled and shows the refusal reason as visible text rather than hiding. A pending Review card is never mistaken for claimed this way, even if it was opened via a CLI session earlier in its life. Focus (jump to a live CLI session's pane), Answer, Kill, Accept (once the card reaches Review), and Cancel remain the controls the drawer still offers; Cancel applies to a claimed card regardless of whether it carries an engine-specific assignee tag — a bare `#agent` card the worker claimed keeps Cancel as its one recovery action even though there's no assignee tag left to edit it back to a workable state. No control on an agent-owned card is ever hidden once refused — Cancel included — it renders disabled with the reason visible next to it.
+- **Cancel** (see [Cards and the drawer](#cards-and-the-drawer)) works whether or not the worker has claimed the card, and is the one way to get rid of an agent-owned card the board otherwise won't let a human drag anywhere — except a card that's already finished (accepted-and-done, or already cancelled), which has nothing left to cancel.
+
+A refused drag shows a toast with the reason instead of moving the card; the board and the drawer both refuse the exact same set of moves, computed by the same server-side rule so they can't disagree.
+
+### Assignee
+
+Assignee is a single tag, one of `#me`, `#claude`, `#codex`, `#hermes`, `#local`, `#cloud`. Dropping a card into Assigned sets that tag and clears any other assignee tag; dropping into Unassigned clears it. An engine assignee is the worker handoff, so a separate `#agent` tag is not required. The drawer's **Open** action can still start a CLI session immediately on an Assigned `#claude`/`#codex` card, and the worker reads the card's model/effort/host fields when it claims it (see [Card assignment](../technical/agent-worker.md#card-assignment-851)).
+
+### Cards and the drawer
+
+A card shows its title, assignee chip, model/effort chips when the task carries those fields, host chips when the card is assigned to a machine other than the one running the API or a linked session ran somewhere, its other tags, and a pulsing dot when a linked session is actively running. The host chips carry two distinct meanings: an assigned-host chip when the card's host field names a machine other than the one running the API — the assignment, where the card will run — and a ran-on chip when a linked session ran somewhere and no assigned-host chip already names that host — the observation, where it did run. A card carrying both shows them distinguishably; a card assigned to another machine whose linked session ran on that same machine shows only the assigned-host chip; a card carries neither when it has no host field naming another machine and no linked session ran anywhere.
+
+Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — below those — model, effort, and host pickers for engines that accept them (`#claude`/`#codex` show all three, `#local` shows effort only, `#me`/`#hermes`/unassigned show none; model options come from the model catalog per engine, with the card's saved model already selected before that catalog resolves, so a save made in the meantime carries it rather than clearing it; whenever the catalog does resolve — on every drawer open, and again after an engine change — a saved model the card's current engine lists keeps its ordinary label and stays selected, one only some other engine's catalog lists drops to "engine default", and one no engine's catalog lists stays selected, labeled `(unknown)`, and survives every later save; choosing "engine default" clears it) that write the fields the executors actually read. Host is a dropdown of the known machines — the API host plus every registered host, each labeled `(offline)` or `(unknown)` when it isn't reachable, sourced from Tailscale where available — rather than free text; an empty choice ("this machine") means the card runs wherever the API does, and a card whose saved host has since dropped out of the registry still shows it, labeled `(unknown)`, rather than silently losing the value. A picker save that actually fails shows a toast with the reason and snaps that picker back to its last-saved value, unless the operator has already picked something newer on that same control while the failed save was in flight — that newer choice is left alone and saves on its own; a successful save never shows a toast. A drawer rebuild that lands while a picker save is still in flight never seeds the pickers with a value older than that save. If the host registry itself couldn't be loaded (or a drawer opened during a cooldown after repeated failures), the host dropdown shows a disabled "hosts unavailable — reopen to retry" option instead of silently looking like no hosts are registered; closing and reopening the drawer retries the fetch. The assignee select, the Tags field, and the model/effort/host pickers disable themselves — showing the reason as visible text next to the control, never just hidden — whenever the card's current state forbids editing that field (see [Human moves on agent-owned cards](#human-moves-on-agent-owned-cards)). The Tags field never shows the worker's own lifecycle tags (`#agent-running`, `#agent-blocked`, `#agent-completed`, `#agent-failed`, `#agent-budget-exceeded`, `#accepted`) as editable tokens, never lets one be typed in — the same rejection a stray assignee name already gets — and always keeps whatever the card already has on save, so a Tags edit can never grant or strip a claim the worker didn't make. On a task card, the notes field grows with its content as you type (and when the drawer opens on a card with existing notes), up to two-thirds of the viewport height, after which it scrolls internally rather than growing further; a Scheduled card's message field (see [Scheduled column](#scheduled-column)) keeps a fixed box. When the card has a linked session, the drawer also shows that session's live transcript feed, the same panel the Graph tab uses. The drawer's action row and the Graph tab side panel's own action row are decided and rendered by the same logic, so the same session offers the same actions — same labels, same order, same enabled/disabled state — on both tabs, including Open for an Assigned card and Answer when a pending question exists: the Graph tab's side panel finds its session's linked card the same way the drawer does, not just when it happens to be opened from the board. A session with no linked card at all (the board never tracked it, or hasn't loaded yet) simply doesn't offer the actions below that need one (Open, Answer when no session-level question is open, Accept, Resolve, Cancel, Delete). Drawer actions, in the order they render: **Open** (an Assigned card tagged `#claude` or `#codex` spawns the CLI on the card), **Rename** (inline-edit the session's label — the same edit clicking the label itself starts), **Go To** (jump to the session's terminal pane — the same control the Graph tab's side panel offers), **Resume** (open a new terminal and resume a stopped Claude Code or Codex session — see [Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)), **Kill** (stop a running session — disabled with a reason if the linked session is a Claude Code or Codex CLI pane, since Kill can't tear down that process either; close it manually instead — including a cascade preview of any non-terminal descendant sessions, the same confirmation the Graph tab's side panel uses; the confirm button stays disabled until that preview has resolved, and a failed lookup says so explicitly rather than looking like the session simply has no descendants), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), **Resolve** (mark a manually-filed Human queue card handled, offered only when Done is actually reachable from the card's current state), **Cancel** (available on any agent-owned card that isn't in Review or already finished, whether or not the worker has claimed it — kills the card's live session, if one exists, cascading to every descendant exactly like Kill does, then marks the task cancelled so it lands in Done behind "include cancelled"; no confirmation dialog), and **Delete** (offered on every task card, including Review, and on every scheduled card; always behind a confirmation naming the card). If the card was opened as a CLI session (a Claude Code or Codex pane, rather than a session the worker itself started), Cancel can't stop that process yet — it still marks the card cancelled, but toasts a warning naming the session it couldn't stop instead of a plain success, so the operator knows to close that pane by hand. The Delete confirmation reflects the card's session state at the moment Delete is clicked. For a task card with a live session that isn't a Claude Code or Codex CLI pane, it says deleting will kill the running session and its subagents first, and confirming does that kill before removing the card; a kill that fails leaves the card in place, toasts the reason, and keeps the confirmation open to retry. A CLI-backed live session can't be killed from here, so its confirmation deletes the card without attempting a kill and says to close the pane by hand. If a kill becomes necessary while the confirmation is open, confirming updates the note to the kill wording and asks for a second confirm rather than killing a session the operator was never warned about. Confirming closes the drawer and removes the card from the board; cancelling leaves everything unchanged. Clicking anywhere outside the drawer — the board background, a lane, or another card — closes it exactly like its close button; a click inside the drawer never does. Escape closes the drawer, but does nothing while the New card composer, the Answer prompt, or the Delete confirmation is open on top of it.
+
+A **New card** button in the filter bar opens a composer — title, optional notes, a lane picker, and an assignee picker — that creates a task. Each visible lane also carries its own full-width **+** button above its cards, opening the same composer with that lane preselected. A few rules govern how Lane and assignee interact:
+
+- Picking an assignee while Lane still reads Unassigned flips Lane to Assigned, since a task carrying an assignee tag always files there regardless of what Lane says; manually overriding Lane back to Unassigned afterward doesn't change where the card lands.
+- Clearing the assignee back to blank while Lane reads Assigned flips Lane back to Unassigned.
+- Picking Assigned (from the top-bar button or a lane's own **+**) requires an assignee; the created card carries it as a tag.
+- Picking In progress with an agent assignee (`#claude`/`#codex`/`#hermes`/`#local`) is rejected before anything is created — only `#me` can be assigned directly to In progress, since the worker claims agent-assigned tasks itself.
+- Review and Scheduled don't get a **+** — neither lane can be set directly; a card reaches Review or Scheduled the same way it always has (the worker's own tags, or the scheduler).
+- Creating a card straight into a lane the filter is currently hiding reveals that lane, updating the saved filter selection, so the new card is actually visible.
+
+### Pending questions
+
+When an agent asks a clarifying question, the card carrying that session shows the question text and an **Answer** button in the drawer. Answering writes the reply through the same path a Telegram reply takes — the worker resumes the session on its next tick exactly as if you'd answered by text.
+
+### Scheduled column
+
+Each card shows the entry's next fire time, a recurring badge for cron entries, and — once it has fired at least once — the most recent run's outcome and a short result snippet. The drawer edits the whole schedule, saving through the same `PUT /api/scheduler/{id}` the `/api/scheduler` UI uses — there's no separate write path for the board. Its fields are: name, message, and an enabled checkbox; schedule type (cron or one-off) and the schedule value (a cron expression or an ISO datetime — the field's label and placeholder switch with the type); an IANA timezone; the action (`notify`, `prompt`, `endpoint`, or `agent`); an executor picker shown only when the action is `agent`, with an empty option meaning the schedule carries no executor tag and takes the agent worker's own default route; and a bot picker shown only otherwise, listing exactly the names `GET /api/scheduler/bots` returns plus an empty "default (primary)" option, so no unaccepted name can be typed or chosen. A stored bot name absent from a loaded list still shows as a selected, distinctly labeled `(unknown)` option rather than leaving the picker blank. When the registry fetch itself fails, the stored name isn't known to be invalid — just unconfirmed — so it shows plain and selected without that label, and the picker is disabled with the reason shown as visible text next to it. Switching the action select shows and hides the executor and bot controls immediately, without reopening the drawer.
+
+Most fields save independently on blur (text) or change (selects, the checkbox). Schedule type and schedule value are the exception: changing the type only updates the field's label and placeholder locally, and the actual save — carrying both the type and the value together — happens on the value field's next blur, so a type change always reaches the server paired with a value. A save the server rejects — an unparsable cron expression or datetime, an unknown timezone — shows the response's detail inline next to the offending field(s) and reverts them to the last values the server accepted, showing the reason as visible text next to the control rather than as a toast.
+
+A human-readable next-fire preview updates from the response of any save that can change the next fire time — schedule type/value, timezone, or the enabled checkbox — and the drawer shows the last run's outcome. A **Trigger now** button fires the schedule immediately through `POST /api/scheduler/{id}/trigger` and refreshes the drawer's last-run line; for a `once` schedule its label discloses that firing consumes the schedule (the fire disables it and clears its next fire), and a failed trigger shows a toast with the reason. The drawer's Delete action (see [Cards and the drawer](#cards-and-the-drawer)) is offered here too, behind the same confirmation, and removes the entry through `DELETE /api/scheduler/{id}`.
+
+### Filters
+
+Which lanes show at all is a multi-select: a checkbox per lane in a dropdown, plus **All** and **Clear** controls (Clear resets to the default: every lane except Done). An unchecked lane's column is removed from the board entirely, not just emptied of cards, so the remaining lanes widen to fill the space; re-checking it puts it back in canonical lane order. The selection is remembered via `localStorage` (per browser/device, not synced) and restored on your next visit; if nothing at all is checked, the board shows a one-line hint instead of going blank.
+
+The rest of the filters AND-compose on top of whichever lanes are showing: free-text search (title and notes), assignee (including "me", "unassigned", and the cloud engine), host, engine, tag, recency, and whether to include cancelled cards. The host filter's option list names every host that appears either as a card's assigned host or as a linked session's host, and a card matches a selected host when either one names it — so a card assigned to a host that hasn't run a session yet is still reachable through the filter. The engine filter matches a card by its linked session's routing/execution engine; a card with no linked session matches only "all engines". A sort dropdown reorders cards within each visible lane by file order (the default), created date, modified date, or assignee A-Z; schedules and unassigned tasks follow assigned tasks for assignee sorting, and cards missing the selected timestamp stay at the end. The choice is remembered in `localStorage` and never rewrites vault order. **Clear filters** resets all shared filters, lane visibility, cancelled inclusion, and sorting to their defaults. Search, lane, assignee, host, engine, tag, and recency are shared with the Graph tab's own filter bar — see [Linking the board and the graph](#linking-the-board-and-the-graph); "include cancelled" and sorting stay board-only. The board reads tasks from every context file but intentionally has no context-file filter; use tags such as `#work` to partition work. The board updates live — an edit made directly in the vault (or by the agent worker, or by the scheduler) shows up within a few seconds without a page reload.
+
+### Out of scope (for now)
+
+Manual card reordering within a lane. Display sorting is client-only and does not change vault order.
+
+---
+
+## Graph tab — what you see
+
+The Graph tab is a force-directed session map, laid out in labelled columns
+by host. Each node is one session:
+
+| Encoding | Meaning |
+|---|---|
+| **Fill colour** | The session's board lane (the same lane a linked task shows in on the Board tab) — a lane colour legend on the graph tab lists every lane and its swatch. A session's fill uses reduced opacity once it's terminal; the stroke stays the status colour, thicker for `blocked`. |
+| **Shape** | Engine: square = Claude Code, hexagon = Codex, star = Hermes (also covers the `#cloud`/remote-provider path), diamond = Local, circle = Claude (the Managed Agents cloud model). A shape legend on the graph tab names all five. |
+| **Size** | A monotonic function of `total_active_seconds` (floored and capped) — how long the session has actually been working, not how much it's cached. Two sessions with equal active time render the same size regardless of token counts. |
+| **Secondary ring** | A thin accent ring around the node sized by tool-call count. |
+| **Question badge** | A small ring + `?` glyph, offset from the label, when a pending question is open for the operator on this session. |
+| **Error badge** | A count, offset from the label, when `error_count > 0`. |
+| **Collapsed-subagent badge** | On a parent with subagents: `+N` for the currently-hidden direct-child count, or a plain collapse glyph once fully expanded. Click to toggle. |
+| **White pulsing border** | Session is `running` AND has written to its transcript in the last 60 seconds (i.e. *actively producing output right now*) |
+| **Edge** | Spawn relationship — parent → subagent. Hidden while the subagent side is collapsed. |
+| **Position** | Columns group nodes by host (column header: `<host> · <count>`); inside a column, a lane sub-band groups nodes by the same lane the fill colour encodes. Recency is a filter only, not a position signal. |
+
+**Node label** — the text under each node, first non-empty of: an
+operator-pinned custom label, the derived label (task description for
+LifeOS, first non-empty user message for Claude Code — the same value a
+linked board card shows as its title), the AI-generated short summary, the
+most recent prompt preview (cross-machine CLI sessions), the routing name,
+then the first 8 characters of the session id as a last resort. The
+operator-pinned custom label, the derived label, and the AI-generated
+short summary are each skipped when they're not a real label but the raw
+id the row fell back to (the session id, that id with its `cc:`/`cx:` CLI
+prefix stripped, or the row's task id). The model badge (`model_label`)
+is never a candidate here — it renders only as a chip (the hover card, the
+side panel's chip row, the Hermes routing badge), so two sessions on the
+same model never read as the same node. A node never renders a bare `?`.
+
+### Subagent trees
+
+A session with a parent (a Task/Agent-tool subagent) is hidden by default;
+its parent shows the collapsed-subagent badge above. Clicking the badge
+expands the children (and their own spawn edges) into view; clicking again
+collapses them back. Searching for a session inside a collapsed tree
+expands its ancestors automatically so the match is visible.
+
+### Card clusters
+
+Every visible session linked to a board card renders attached to a card
+anchor — a rounded rectangle labelled with the card's title, its stroke
+coloured the same lane colour a session node's own fill uses, positioned
+in the column of the host most of its sessions run on and the lane band
+its own lane occupies. Every session sharing that card attaches to the
+same anchor by a dashed link, distinct from the solid spawn edges above.
+A session with no linked card attaches instead to a host anchor labelled
+with its host name — one per host among the sessions with no card. A
+card anchor whose sessions include an open pending question renders the
+same question-ring badge a session node shows, on the anchor itself.
+
+Clicking an anchor doesn't open the transcript panel — an anchor groups
+several sessions, not one — but shows the same card actions a selected
+session node shows (see [Linking the board and the graph](#linking-the-board-and-the-graph)) for the card it represents.
+
+### Hover card and canvas controls
+
+Hovering a node shows an HTML card near the cursor — name, host,
+branch or cwd, model and effort, cost, duration, and the last event kind —
+with no delay; moving off hides it.
+
+- **Drag a node** — pins it where you drop it.
+- **Drag the empty background** — pans the whole graph.
+- **Scroll-wheel / pinch** — zooms in and out (0.2× – 5×).
+- **Fit / Reset buttons** — Fit frames every visible node into the
+  viewport; Reset returns to the default pan/zoom. On a large or crowded
+  graph, fitting everything in can require zooming out far enough that a
+  node's own label text would render too small to read at its normal
+  size, so labels grow larger (their line spacing growing along with
+  them, so lines and neighboring labels stay clear of each other) to hold
+  a legible floor. Only past a point where no amount of enlarging holds
+  that floor without labels overlapping are they hidden instead, and the
+  hover card still names whichever node the operator points at. Reset
+  always shows labels again, at their normal size.
+- **Click a node** — opens its transcript in the side panel immediately
+  (no artificial delay) and highlights its parent/child relationships
+  (selected node gets a thick white border, 1-hop neighbors get a thinner
+  white border, everything else dims).
+- **Double-click a non-subagent Claude Code or Codex node** — jumps focus
+  to its terminal (see [Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)); the side panel opening on the first click of the pair is expected.
+- **Click the same node again, or click empty background** — deselects and closes the panel. Double-clicking a non-subagent Claude Code or Codex node is the exception: the pair's first click closes the panel and the double-click reopens it on that same session as focus jumps to its terminal.
+- **Filter change** — releases any drag-pinned positions and resets the pan/zoom transform so the new visible set lays out from scratch at the natural scale.
+
+The simulation restarts whenever the visible-id set OR any visible node's
+size changes (a session growing in active seconds reheats the layout, not
+just a session appearing or disappearing), and auto-stops 8 seconds after
+its last restart.
+
+---
+
+## Two sources, one graph
+
+The Graph tab unions three ingest paths into one rendered surface:
+
+1. **LifeOS agent worker** — every `#agent` task the worker has claimed, plus its sleeps, yields, terminal outcomes, and any spawned children. This is the same data covered by [product/agent-worker.md](agent-worker.md); the viz is the read-side view of it.
+
+2. **Claude Code CLI** — every transcript jsonl under `~/.claude/projects/`, scanned every snapshot tick (with a 30s cache so the disk isn't hammered). Each `.jsonl` file is one session; subagents spawned via the Task/Agent tool appear as separate nodes attached by spawn edges. Read-only.
+
+3. **Codex CLI** — every rollout jsonl under `~/.codex/sessions/<year>/<month>/<day>/`, ingested the same way. One JSONL per session, `cx:`-prefixed in the snapshot. Read-only.
+
+All three sources are normalized to the same shape before rendering, so filters, chips, and the side panel work identically on each kind of session. Disable an ingest path with `LIFEOS_CLAUDE_CODE_VIZ_ENABLED=false` or `LIFEOS_CODEX_VIZ_ENABLED=false` if you only want a subset.
+
+Every session, from every source, now carries a `host` field — the machine it's running on. LifeOS agent worker sessions and locally-scanned CLI transcripts always report the machine hosting the API; a session registered from elsewhere (see below) reports its own hostname.
+
+### Cross-machine CLI session registration
+
+A Claude Code or Codex session doesn't have to run on the machine hosting the API to show up here. `scripts/lifeos-agent-hook.sh`, installed for both CLIs by `scripts/install-agent-hooks.sh`, posts a lifecycle event on session start, prompt submit, stop, and session end to `POST /api/agents/cli-sessions/events` — from any machine on the tailnet, bearer-token authenticated. The API keeps a small `cli_sessions` record per session (host, cwd, branch, model, status, last prompt preview, and an optional task id read from `$LIFEOS_TASK_ID`) and merges it into the snapshot:
+
+- A session with both a registration and a local transcript (the common case on the API host itself) collapses into **one row** — status comes from the registration events (accurate: `running` right after a prompt, `idle` after Stop, `ended` after SessionEnd), while token counts and dollar cost still come from the transcript.
+- A session registered from a machine with no local transcript (every other machine) appears as its own row with `host` set to that machine's name, no token/cost detail (the hook doesn't read usage data), and status directly from the event stream — never inferred from file age.
+
+This is opt-in: the endpoint is disabled (503) until an operator sets `LIFEOS_AGENT_HOOK_TOKEN`, and each machine needs the installer run once plus a small local env file with the API URL and that same token. See [guides/agents-go-to.md](../../guides/agents-go-to.md) for setup.
+
+### Remote session parity
+
+Registration alone gives a remote session status and a prompt preview, but
+not the rest — token counts, dollar cost, tool-call counts, and the
+transcript feed only exist for a jsonl this API host can read off its own
+disk. For every host in the [operator's host registry](../../guides/agent-worker-setup.md#card-assignment-running-a-card-on-another-machine-851),
+a background loop periodically pulls that host's Claude Code and Codex
+transcript files onto this box over ssh (read-only, incremental — see
+[technical/agent-viz.md](../technical/agent-viz.md#remote-transcript-mirror)
+for the mechanism). The ingest scans those mirrored copies alongside the
+local ones, so a remote session reaches full parity with a local one:
+real tokens, cost, tool calls, and a live transcript feed in the drawer,
+merged with the registration event's status the same way a local
+transcript already merges (event status wins; token/cost detail stays
+transcript-derived). A mirrored session's `running` status can only come
+from a registration event, never from a process scan on this machine — a
+transcript existing here doesn't mean the CLI is actually running here.
+
+---
+
+## Graph tab — Status semantics
+
+A node's stroke colour is its status. The set is slightly different per source — same broad categories, different precise meaning:
+
+| Status | LifeOS agent worker | CLI (Claude Code or Codex) |
+|---|---|---|
+| **running** | Currently executing tool calls or LLM turns. | A live `claude` / `codex` process is running with this jsonl's cwd, **or** the file was modified in the last 10 minutes. The first is authoritative; the second is inferred. |
+| **claimed** | Worker has picked up the task but hasn't fired the executor yet (preflight is in flight). | n/a |
+| **yielded** | Paused waiting for spawned children to finish. | n/a |
+| **idle** | n/a | Registered via the session hook (#849): open and waiting for input, after a `session_start` or `stop` event. Live, not finished. |
+| **inactive** | n/a | Modified within 24h but no live process — typically you closed the terminal mid-session. Resumable. |
+| **blocked** | Waiting on a Telegram clarification from you. | n/a |
+| **completed** | Task ran to completion successfully. | jsonl is >24h old, no error in the last event. |
+| **failed** | Executor crashed, preflight rejected, or runtime error. | Last event in the jsonl was an error/tool failure (and >24h old). |
+| **ended** | n/a | Registered via the session hook (#849): a `session_end` event was received — finished. Hidden by default like completed/failed; Resume available. |
+| **budget_exceeded** | Token / wall / dollar cap breached and the session was killed externally. | n/a |
+
+A small `(inferred)` hint appears next to the status on CLI sessions whenever the status came from mtime rather than from a confirmed live process — useful to know when reading "running" on a session you don't remember starting.
+
+---
+
+## Graph tab — Filters and chips
+
+The top toolbar has filter controls and five count chips. **Filters are AND-composed**; the chips reflect *what's currently visible* after the filter, not the full snapshot. `recency`, `route` (engine), `lane`, `assignee`, `tag`, and the free-text search input are shared with the board's own filter bar — see [Linking the board and the graph](#linking-the-board-and-the-graph). `host` is board-shared too, via the same mechanism.
+
+### Filters
+
+| Filter | Default | Notes |
+|---|---|---|
+| `include finished` checkbox | off | Off → completed / failed / budget_exceeded / ended are hidden. On → those sessions show (subject to every other filter, `lane` excepted — see the `lane` row below), and the recency window auto-defaults wider. Graph-only — no board counterpart. |
+| `recency` dropdown | auto: last 30 min, or 7 days once `include finished` is checked (1 min, 30 min, 1h, 24h, 7d, all also selectable) | Filters by `last_activity_at`. Shared with the board, whose own default is all time — the shared value starts unset so each tab keeps its own default until the operator (on either tab) picks one explicitly, which then applies on both. Board recency filters by `updated_at` instead — each tab keeps its own comparison field, only a chosen value is shared. |
+| `cwd` dropdown | all | Only Claude Code sessions are scoped to a cwd. Dropdown lists every unique cwd present in the current snapshot; auto-hides when empty (no Claude Code sessions visible). Graph-only — no board counterpart. |
+| `host` dropdown | all | Limit to sessions running on a specific machine. Dropdown lists every unique `host` present in the current snapshot; auto-hides on a single-host deployment (nothing to distinguish). |
+| `route` dropdown | all (local / claude / claude_code / codex / hermes / remote / ask) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, Claude Code CLI, Codex CLI, Hermes, the configured remote provider, or a session parked waiting on the operator. Labelled **engine** on the board's own bar. |
+| `status` dropdown | all | Hard-filter by the status column from the table above. Graph-only — no board counterpart. |
+| `lane` dropdown | every lane but Done | A single-select mirror of the board's own lane multi-select — `all` shows every lane, one lane shows just that lane. A session with no lane info (a fixture predating this field) is never excluded by it. The Done lane is the one exception: whether a Done-lane session renders is decided by `include finished` alone, never by this selection, so the two controls can't disagree about the same set of sessions — picking `done` here shows only Done-lane sessions and checks `include finished` automatically, since otherwise the selection would show nothing. |
+| `assignee` dropdown | any assignee | Same options as the board's assignee filter — `unassigned` matches a session with no card assignee. |
+| `tag` text input | empty | Substring match against the linked card's tags. |
+
+### Chips
+
+| Chip | What it counts |
+|---|---|
+| `running` | Visible sessions with status `running`. |
+| `blocked` | Visible sessions waiting on Telegram clarification. |
+| `recent` | Visible sessions with status `completed` or `ended`. |
+| `cc` | Visible CLI sessions (Claude Code and Codex rolled together). |
+| `API spend` | Sum of `total_dollars` across visible **LifeOS** sessions. Both CLIs are intentionally excluded — they're billed against your Claude Pro / ChatGPT subscriptions, not metered API tokens, so adding them would distort the chip's meaning. The per-session dollar columns on CLI nodes still show the equivalent API cost as a relative-cost signal. |
+
+Chips re-compute after every snapshot tick, so toggling `include finished` immediately bumps the API-spend number to include the finished sessions' final cost.
+
+---
+
+## Graph tab — Side panel
+
+Clicking any node opens a panel on the right with that session's metadata header and a live-tailing event feed. The panel header carries:
+
+- **Label** — the same precedence chain the graph node uses (see **Node label** in [Graph tab — what you see](#graph-tab--what-you-see)), so the header never shows a session's raw id when the node or the search dropdown wouldn't. **Click it, or the action row's Rename button, to rename:** the title becomes a text box. It opens prepopulated with the current custom label or derived label, or empty when neither is a real name (only a raw id) — so blurring without typing never persists a raw id as the custom label. Enter (or clicking away) saves, Escape cancels. A manual name is pinned durably and overrides every other source everywhere the node is named (graph node, panel, search), except that a manual name identical to the row's own raw id is skipped by the graph node and the search dropdown the same way any other raw-id label is. Saving an empty value clears the override and reverts to auto-naming.
+- **cwd** — Claude Code only; the project directory the session was opened in.
+- **Branch** — the git branch of that cwd, when a registration event supplied one. Blank for sessions with no cross-machine registration (e.g. a local Claude Code transcript with no hook installed).
+- **Status badge** — the status the node's stroke encodes, with `(inferred)` if applicable.
+- **Source** — `LifeOS agent` or `Claude Code`.
+- **Host badge** — the machine the session is running on.
+- **Routing** — a plain badge, one of `Local`, `Claude Code`, `Codex`, `Remote`, `Hermes`, `Ask` (parked waiting on the operator, no model running), or `Claude` — never a model name, EXCEPT for a Hermes session that has taken at least one turn: its badge shows `model_label` (`Hermes · <model>`, the honest per-session attribution the server records once that session's own turn reports a model) instead of the plain `Hermes` name. A Hermes session with no turn yet, and every non-Hermes session, show exactly the plain routing name.
+- **`.panel-chips` row** — small chips below the header: `model_label` and the engine name (from the same five-engine mapping the node's shape uses), each dropped when its text already equals the Routing badge's text above it, plus the effort when present. The host is not repeated here — the meta row's host badge already shows it. Display-only metadata, never the header's name.
+- **Cost** — `total_dollars` to 4 decimals. For Claude Code, this is cache-aware accounting (separately tracking input, output, cache_creation @ 1.25× and cache_read @ 0.10×).
+- **Tokens** — `input↓ / output↑`.
+- **Depth badge** — if the session is a child, shows spawn depth.
+- **Last prompt preview** — the most recent prompt submitted, truncated to 200 characters, when a registration event supplied one.
+
+The event feed is newest-on-top. Backfill arrives first (the last 50 events by default), then live updates stream in via SSE. Each event has:
+
+- A **kind label** — click to filter the feed to just that kind (e.g. `tool_call`, `user_message`, `failed`). Click again to clear. When a session first opens with any `user_message` events present, the filter auto-defaults to `user_message` to focus the view on the operator-visible turns.
+- A **timestamp** in your local timezone.
+- A **payload preview** — rendered as structured fields (model badge, routing decision, tool-call pills `Name(arg, arg)`, compact budget `90s · $0.30 · 500k tok`, usage summary `↓ in · ↑ out · cache read/create`, free-text fields like `ambiguity` / `question` / `reason`). Noisy fields (`iterations`, nested `ephemeral_*`, etc.) are suppressed. Click anywhere on the event to expand — the raw JSON appears beneath the structured view for diagnostics; click again to collapse.
+
+The panel is **resizable**: drag the left edge to widen or narrow it. The chosen width is remembered across sessions via `localStorage`.
+
+Clicking the same node again, the `×` button, or empty background area closes the panel and clears the graph selection. You can click another node directly to switch focus.
+
+---
+
+## Graph tab — Operator controls — kill
+
+LifeOS agent sessions in non-terminal states get a red **Kill** button in the panel header. Clicking it opens a confirmation modal asking for an optional reason (logged to the transcript) before firing the request.
+
+A kill takes down the target session **and every descendant in its subtree** — not the whole spawn root, only what hangs below the node you clicked:
+
+- The target session gets an `operator_killed` transcript event.
+- Each descendant gets a `cascade_killed` event.
+- If the target was a Managed Agents (cloud) session, the worker process also tears down the remote session via the Anthropic API so you stop being billed for idle session-hours.
+- The task in your vault transitions to whatever the worker writes as the post-kill tag (typically `#agent-failed`).
+
+CLI sessions (Claude Code and Codex) do not get a Kill button — the page has no safe primitive for terminating a CLI process from outside its own terminal. If you need to stop one, do it in the terminal where it's running, or via `kill` on the underlying PID.
+
+---
+
+## Graph tab — Operator controls — resume and Go To
+
+CLI sessions (Claude Code AND Codex) get up to two buttons:
+
+**Resume** (shown on terminal / `inactive` / `yielded` sessions) opens a new WezTerm tab at the session's working directory and launches `claude --resume <session_id>` or `codex resume <session_id>` in it. WezTerm prints the new pane id; LifeOS stores it in a sidecar SQLite mapping (`data/cc_wezterm.db`) keyed by session id (`cc:` or `cx:` prefix disambiguates).
+
+**Go To** (shown on every non-subagent CLI session, including live ones) jumps focus to the existing WezTerm pane for that session. Double-clicking the node in the graph does the same thing. The endpoint resolves the pane id in three steps:
+
+1. **Cached mapping** — first checks `data/cc_wezterm.db`, populated by either a prior Resume click *or* the optional SessionStart hooks (`scripts/claude-session-pane.sh` for Claude Code, `scripts/codex-session-pane.sh` for Codex) which bind every new CLI start to its wezterm pane via `/api/agents/cc-pane-bind` and `/api/agents/cx-pane-bind` respectively. The cache is auto-invalidated when wezterm restarts: each mapping records the wezterm-gui pid it was written under, and a fresh wezterm boot drops the entry rather than blindly activating a stale `pane_id` (which could now belong to an unrelated session).
+2. **FD probe** — if the cache misses, `lsof` finds which process holds the session's transcript file open; the holder's controlling TTY is matched against `wezterm cli list --format json`'s `tty_name`. Cwd is not enough to disambiguate when multiple panes share a project; the transcript file is. The result is cached for the next click.
+3. **Activate-pane** — once a pane id is known, `wezterm cli activate-pane --pane-id <id>` switches focus. If WezTerm is the focused window the tab switches immediately; if it's hidden, the pane is selected in the background and a `notify-send` urgency hint pulses the dock icon. The OS-level window-raise across applications is restricted by Wayland compositors (no programmatic foreground steal); WezTerm under XWayland can be raised via `wmctrl`/`xdotool` if the operator needs it.
+
+If a cached pane has gone stale (typical: user closed the tab), the activate-pane call fails, the mapping is cleared, and the probe runs once more — the session may have been resumed in a fresh pane. Only when both the cache *and* a fresh probe come up empty does Go To return 404 (toast: "Couldn't locate pane — install the SessionStart hook if claude is running in wezterm"); when a pane existed but is gone and no replacement can be found it returns 410.
+
+Resume + Go To are **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true` for Claude Code sessions and `LIFEOS_CODEX_RESUME_ENABLED=true` for Codex; each flag also gates Go To for its respective source. Customize launchers via `LIFEOS_CC_RESUME_CMD` / `LIFEOS_CODEX_RESUME_CMD` if you don't use WezTerm — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}`, and `{inner_command}` are available. The probe-based Go To is WezTerm-specific (it reads `wezterm cli list`'s `tty_name`); non-WezTerm launchers can still use Resume but Go To will respond 404.
+
+A session registered from another host (see "Cross-machine CLI session registration" above) resumes and focuses over ssh when that host is one of the operator's registered hosts (see [Card assignment](../technical/agent-worker.md#card-assignment-851)) — the same launcher runs remotely, so Resume and Go To work wherever the session actually lives. Only a host the operator hasn't registered still 409s: the error names that host, so the operator knows to go there instead of getting a silent no-op or a misleading 404.
+
+### Resume here
+
+Next to Resume, the drawer offers a small host picker listing this API's
+own machine plus every registered host — "resume here" lets the operator
+choose where the session should actually open, regardless of which
+machine it originally ran on:
+
+- Choosing this API's own machine or a registered host launches there over
+  the same mechanism as above (locally, or over ssh), overriding the
+  session's recorded host.
+- Choosing a machine that isn't this API host and isn't registered can't
+  be launched from here — the drawer instead shows the exact resume
+  command (`cd <cwd> && claude --resume <id>` or the Codex equivalent) as
+  copyable text, so the operator can paste it into a terminal on that
+  machine themselves. The command is omitted when the session's cwd
+  can't be resolved — there's nothing to show.
+
+---
+
+## Linking the board and the graph
+
+The board and the graph describe the same work from two angles, kept in one navigational state.
+
+**Card session chip → graph.** A task card whose linked session exists shows a small clickable session chip (↗ session) among its other chips; clicking it switches to the Graph tab, pans to that session's node, and selects it.
+
+**Node → board.** Selecting a node, or a card anchor (see [Card clusters](#card-clusters)), shows a **Show on board** action above the transcript panel whenever it — or, for an anchor, one of its sessions — is linked to a card. Clicking it — or simply switching to the Board tab while that node or anchor stays selected — scrolls to the card and briefly highlights it, relaxing whichever shared filters (lane, assignee, host, engine, tag, search, recency) currently hide it first.
+
+**Answer from the graph.** A selected node or card anchor with an open pending question shows an **Answer** action next to Show on board; it reveals an inline reply box in place and posts through the same endpoint the board drawer's own Answer button uses.
+
+**Deep links.** `/agents?session=<id>` opens the Graph tab with that session selected and centred; `/agents?card=<id>` opens the Board tab with that card's drawer open. An id that doesn't resolve — no such session, no such card — shows a toast and leaves the default view.
+
+**Shared filters.** Search, lane, assignee, host, engine, tag, and recency are one filter state shared by both tabs' filter bars — changing one on either tab updates the other, and the selection persists across reloads (`localStorage`, per browser/device). A **Clear** button on each bar resets every shared filter to its default. The board's own lane multi-select IS this shared state's lane selection; the graph's own lane filter is a single-select (`all`, or one lane) reading and writing the same selection — picking one lane there sets the shared selection to just that lane, and picking `all` sets it to every lane. The board's assignee/host/tag/recency filters and the graph's `route` filter (labelled **engine** on the board's own bar) are the remaining five shared keys — an engine match is by the session's routing/execution engine, so a card with no linked session only matches "all engines". Each tab still keeps one filter of its own with no counterpart to share: the board's context filter and "include cancelled" checkbox, and the graph's include-finished toggle, cwd filter, and status filter.
+
+---
+
+## Privacy and exposure
+
+- The Resume/Go To/kill primitives act only on **this** machine and on a registered host over ssh (see below); the local transcript scan reads only this machine's own transcript directories. Cross-machine visibility is otherwise opt-in and one-directional: another machine's hook posts a small lifecycle event (host, cwd, branch, status, a truncated prompt preview) to this API.
+- The transcript mirror is the one path where this API reads files from another machine: for each host in `LIFEOS_AGENT_HOSTS` (empty by default), unless `LIFEOS_AGENT_TRANSCRIPT_MIRROR_ENABLED` is disabled, it pulls that host's Claude Code and Codex transcripts read-only over ssh onto this box. Nothing is ever written back to a remote host.
+- The registration endpoint (`POST /api/agents/cli-sessions/events`) is bearer-token gated and disabled by default (503 until `LIFEOS_AGENT_HOOK_TOKEN` is set) — unlike the kill/resume endpoints below, it's meant to be reachable over Tailscale, since that's the whole point.
+- Transcript payloads are truncated to 240 chars in the feed previews — click an event to see the full payload only on demand. A registered session's prompt preview is truncated to 200 characters at the source.
+- The kill, resume, and pane-bind (`/cc-pane-bind`, `/cx-pane-bind`) endpoints are **local-network only**. They must not be exposed via Tailscale Funnel or the public MCP HTTP transport (the gates live in [api/routes/agents.py](../../../api/routes/agents.py); see the technical spec for the threat model). Resume and Go To act on sessions recorded as running on this API's own host directly, and on a registered host over ssh; a session on an unregistered host returns an error naming that host instead.
+- Claude Code ingest is strictly read-only — LifeOS opens jsonl files for reading and never writes back, whether the file lives on this machine or in the transcript mirror.
+
+---
+
+## Configuration knobs
+
+All in `.env`. None are required — the defaults work for the standard LifeOS install.
+
+| Var | Purpose | Default |
+|---|---|---|
+| `LIFEOS_CLAUDE_CODE_VIZ_ENABLED` | Surface Claude Code CLI sessions alongside agent worker sessions. Set false to scope the viz to LifeOS sessions only. | `true` |
+| `LIFEOS_CLAUDE_CODE_PROJECTS_DIR` | Where to find Claude Code transcripts. | `~/.claude/projects` |
+| `LIFEOS_CLAUDE_CODE_LOOKBACK_DAYS` | Discovery window — older jsonl files are excluded from the snapshot (they can still be loaded by direct session id). | `7` |
+| `LIFEOS_CC_RESUME_ENABLED` | Enable the Resume and Focus buttons, and the board drawer's **Open** action for `#claude` cards. | `false` |
+| `LIFEOS_CC_RESUME_CMD` | Launcher command. Substitutions: `{session_id}`, `{cwd}`, `{session_id_url}`, `{cwd_url}`, `{inner_command}`. The default uses WezTerm's CLI to open a tab AND run the resume in one shot. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
+| `LIFEOS_CC_RESUME_INNER_CMD` | The command run *inside* the spawned terminal — the actual `claude --resume` invocation. Substituted into `{inner_command}` of the launcher template. | `claude --dangerously-skip-permissions --resume {session_id}` |
+| `LIFEOS_CC_RESUME_ENV_FILE` | Optional `key=value` file pinning `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the spawned terminal. | `` (inherit systemd env) |
+| `LIFEOS_CODEX_VIZ_ENABLED` | Surface Codex CLI sessions alongside the other sources. | `true` |
+| `LIFEOS_CODEX_SESSIONS_DIR` | Where to find Codex rollout JSONLs. | `~/.codex/sessions` |
+| `LIFEOS_CODEX_LOOKBACK_DAYS` | Discovery window for Codex rollouts. | `7` |
+| `LIFEOS_CODEX_RESUME_ENABLED` | Enable Resume + Go To for `cx:` sessions, and the board drawer's **Open** action for `#codex` cards. | `false` |
+| `LIFEOS_CODEX_RESUME_CMD` | Codex launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
+| `LIFEOS_CODEX_RESUME_INNER_CMD` | Inner command inside the spawned terminal — the actual `codex resume` invocation. | `codex resume {session_id}` |
+| `LIFEOS_AGENT_HOOK_TOKEN` | Bearer token required from `scripts/lifeos-agent-hook.sh` on `POST /api/agents/cli-sessions/events`. Empty (default) disables the endpoint (503) — a fresh clone accepts no cross-machine session data until this is set. | `` |
+| `LIFEOS_AGENT_TRANSCRIPT_MIRROR_ENABLED` | Enable the remote transcript mirror loop. Safe on by default — with no hosts in `LIFEOS_AGENT_HOSTS` it never runs anything. | `true` |
+| `LIFEOS_AGENT_TRANSCRIPT_MIRROR_DIR` | Local directory the mirror writes into, one subdirectory per registered host. A relative path resolves against the repo root, not the process's working directory. | `data/agent-transcript-mirror` |
+| `LIFEOS_AGENT_TRANSCRIPT_MIRROR_INTERVAL_SECONDS` | How often each registered host's transcripts are re-pulled. Each pull is incremental, so a short interval costs little when nothing changed. | `120` |
+
+---
+
+## Related Documents
+
+- [API Reference](api-reference.md) — HTTP contracts for the board's lane, accept, and cancel endpoints
+- [ADR-011: External Agent Ingest](../../adr/011-external-agent-ingest.md) — Why Claude Code sessions surface read-only via a foreign-schema adapter
+- [Agent Viz — Technical](../technical/agent-viz.md) — Endpoint shapes, D3 force config, status inference rules, security boundaries, and the board's lane-derivation rules
+- [Agent Worker](agent-worker.md) — The other half of the picture: how `#agent` tasks get claimed and run
+- [Claude Code Orchestration (product)](claude-code-orchestration.md) — The orchestrator that spawns the Claude Code sessions surfaced here
+- [Agent Worker — Technical](../technical/agent-worker.md) — Sessions, transcripts, kill primitives
+- [Architecture](../technical/architecture.md) — Where the viz fits in the broader code structure
+- [Task Management](task-management.md) — The vault task store the board's cards are backed by
+- [Human Queue](../../guides/human-queue.md) — How `#human` cards are filed and auto-resolved by agents and the nightly sync
+- [Scheduler Guide](../../guides/scheduler.md) — How the Scheduled column's entries are created and edited

@@ -1,0 +1,3787 @@
+"""Browser test for the /agents Kanban board (#850).
+
+Serves `web/` itself from an ephemeral port (like
+`test_voice_mic_block_ui_browser.py`) rather than pointing at a running API,
+and stubs every `/api/` call the page makes — the assertions are about the
+JS in `web/agents/board.js` and `web/agents.html`, not the live backend.
+No `requires_server` marker, so this runs at pre-push
+(`browser and not requires_server`).
+
+Covers: drag between lanes (asserts the stubbed PUT lane body; asserts the
+card does NOT move and a toast shows when the stub returns 500), drawer
+notes edit + blur (asserts the stubbed PUT /api/tasks body carries `notes`),
+filters including assignee=me and lane=human_queue combined, and (#859) the
+assignment pickers mounted in the drawer — render from the model catalog,
+one save per picker, the Open action's success and 409 paths, and that
+scheduled cards render no pickers.
+"""
+import copy
+import http.server
+import json
+import re
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from playwright.sync_api import Page, expect
+
+pytestmark = [pytest.mark.browser, pytest.mark.slow]
+
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+
+# Obviously synthetic — same shape GET /api/agents/models returns (#851).
+_MODEL_CATALOG = {
+    "engines": {
+        "claude": [
+            {"id": "claude-opus-5", "label": "Claude Opus 5", "pricing": None},
+            {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "pricing": None},
+        ],
+        "codex": [{"id": "gpt-5.5", "label": "GPT-5.5", "pricing": None}],
+        "local": [],
+        "hermes": [],
+    },
+    "refreshed_at": "2026-01-01T00:00:00Z",
+    "stale": False,
+}
+
+# Obviously synthetic — same shape GET /api/agents/hosts returns.
+_HOST_CATALOG = {
+    "hosts": [
+        {"name": "desktop-box", "ssh_target": None, "online": True, "is_api_host": True},
+        {"name": "build-box-2", "ssh_target": "operator@build-box-2.example", "online": True, "is_api_host": False},
+    ],
+    "refreshed_at": "2026-01-01T00:00:00Z",
+}
+
+# Assignee-name tags board.js's own drawer strips/re-adds on an assignee
+# change (web/agents/board.js ASSIGNEES) — used by the lane stub below to
+# mirror plan_lane_move's tag bookkeeping on a drawer-driven assign (#859
+# review round 2 finding 1).
+_ASSIGNEE_TAGS = {"me", "claude", "codex", "hermes", "local", "cloud"}
+
+
+class _AgentsHandler(http.server.SimpleHTTPRequestHandler):
+    """Serves the agents board the way api/main.py does: `/agents` is
+    agents.html and the module tree hangs off `/static/`."""
+
+    def translate_path(self, path):
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        if path in ("/agents", "/"):
+            return str(WEB_DIR / "agents.html")
+        if path.startswith("/static/"):
+            return str(WEB_DIR / path[len("/static/"):])
+        return str(WEB_DIR / path.lstrip("/"))
+
+    def log_message(self, *args):  # keep pytest output clean
+        pass
+
+
+@pytest.fixture(scope="module")
+def agents_base_url():
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _AgentsHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# Obviously synthetic board fixture. Lane derivation itself is unit-tested in
+# tests/test_agent_board.py; this fixture only needs shapes the UI renders.
+def _board_fixture():
+    return {
+        "lanes": {
+            "unassigned": [
+                {
+                    "kind": "task", "id": "t1", "title": "Investigate outage",
+                    "notes": "", "status": "todo", "tags": [], "assignee": None,
+                    "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+                    "session": None, "pending_question": None,
+                },
+            ],
+            "assigned": [
+                {
+                    "kind": "task", "id": "t2", "title": "Ship the release",
+                    "notes": "Draft notes", "status": "todo", "tags": ["me"], "assignee": "me",
+                    "fields": {}, "context": "Work", "updated_at": "2026-01-01T00:00:00+00:00",
+                    "session": None, "pending_question": None,
+                },
+                {
+                    # #859: assignee claude/codex (unlike t2's "me") — used
+                    # by the assignment-picker and Open-action tests.
+                    "kind": "task", "id": "t7", "title": "Deploy the release candidate",
+                    "notes": "", "status": "todo", "tags": ["claude"], "assignee": "claude",
+                    "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+                    "session": None, "pending_question": None,
+                },
+            ],
+            "in_progress": [],
+            "human_queue": [
+                {
+                    "kind": "task", "id": "t3", "title": "Debug prod issue",
+                    "notes": "", "status": "blocked", "tags": ["agent-blocked", "codex"], "assignee": "codex",
+                    "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+                    "session": None,
+                    "pending_question": {"id": 1, "session_id": "s1", "question": "Which environment?", "asked_at": 0, "bot": None},
+                },
+                {
+                    "kind": "task", "id": "t4", "title": "Ask the operator about timeline",
+                    "notes": "", "status": "blocked", "tags": ["human", "me"], "assignee": "me",
+                    "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+                    "session": None, "pending_question": None,
+                },
+            ],
+            "scheduled": [
+                {
+                    "kind": "schedule", "id": "s1", "name": "Morning briefing",
+                    "message_content": "Good morning", "enabled": True,
+                    "next_fire_at": "2099-01-01T09:00:00+00:00", "recurring": True,
+                    "last_run": None,
+                },
+            ],
+            "review": [],
+            "done": [
+                {
+                    "kind": "task", "id": "t5", "title": "Archive the old runbook",
+                    "notes": "", "status": "done", "tags": [], "assignee": None,
+                    "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+                    "session": None, "pending_question": None,
+                },
+                {
+                    "kind": "task", "id": "t6", "title": "Cancelled duplicate ticket",
+                    "notes": "", "status": "cancelled", "tags": [], "assignee": None,
+                    "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+                    "session": None, "pending_question": None,
+                },
+            ],
+        },
+        "generated_at": 0,
+        # Synthetic API host — distinguishes a card's assigned host
+        # (fields.host) from "this machine".
+        "api_host": "primary-host",
+    }
+
+
+def _move_card_in_state(board_state: dict, card_id: str, target_lane: str) -> None:
+    """Mutate the stub's in-memory board the way a real PUT .../lane would,
+    so a successful move's follow-up GET /api/agents/board reflects it —
+    otherwise the client's re-fetch-after-success would silently snap the
+    card back to its original lane against a static fixture."""
+    for lane_id, cards in board_state["lanes"].items():
+        for card in list(cards):
+            if card["id"] == card_id:
+                cards.remove(card)
+                board_state["lanes"].setdefault(target_lane, []).append(card)
+                return
+
+
+def _remove_card_from_state(board_state: dict, card_id: str) -> None:
+    """Mutate the stub's in-memory board the way a real DELETE would, so a
+    follow-up GET /api/agents/board reflects the card's removal instead of
+    a re-fetch snapping it back into place against a static fixture."""
+    for cards in board_state["lanes"].values():
+        for card in list(cards):
+            if card["id"] == card_id:
+                cards.remove(card)
+                return
+
+
+def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
+                  schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
+                  lane_response: "list | None" = None, open_calls: "list | None" = None,
+                  open_response: "dict | None" = None, task_posts: "list | None" = None,
+                  cancel_calls: "list | None" = None, cancel_failures: "list | None" = None,
+                  kill_calls: "list | None" = None, kill_status_code: "list | None" = None,
+                  kill_failures: "list | None" = None,
+                  task_deletes: "list | None" = None, schedule_deletes: "list | None" = None,
+                  call_log: "list | None" = None):
+    """Stub d3 (offline CDN) + every /api/ call the page makes.
+
+    `open_calls`: appended with each opened card id (POST
+    /api/agents/board/cards/{id}/open). `open_response`, when given, is
+    `{"status": <code>, "detail": <str>}` — the 409 failure path;
+    omitted defaults to a 200 success. `GET /api/agents/models` is served
+    from `_MODEL_CATALOG`; `GET /api/agents/hosts` from `_HOST_CATALOG`.
+
+    `kill_calls`: appended with each killed session id (POST
+    /api/agents/sessions/{id}/kill). `kill_status_code`, when given,
+    is a one-element list read fresh on every kill call (mirrors
+    `lane_status_code`) — a non-200 entry makes the kill stub fail.
+    `kill_failures`, when given, makes a 200 kill response report those
+    entries under `failures` (and an empty `killed` list) instead of a
+    clean kill — the "the endpoint said OK but didn't actually kill
+    anything" shape, distinct from `kill_status_code`'s transport failure.
+    `task_deletes`/`schedule_deletes`: appended with each deleted id
+    (DELETE /api/tasks/{id} / DELETE /api/scheduler/{id}); a successful
+    delete also removes the card from `board_state` so a re-fetch shows
+    it gone. `call_log`: when given, every kill and delete call above
+    also appends an `("kill"|"task_delete"|"schedule_delete", id)` tuple
+    here, in the order the requests actually arrived — for asserting a
+    kill happened before its delete.
+
+    `board_stream_frames`: SSE frame strings (each a full
+    "event: board\\ndata: {...}\\n\\n" block), delivered one per *reconnect*
+    — the first connection gets none, the second gets frames[0], the third
+    frames[1], and so on. A `route.fulfill` response is a single static
+    body, so it always closes the EventSource immediately after delivery;
+    Chromium auto-reconnects per the SSE spec, and the `retry: 20` directive
+    below makes that reconnect fast enough for a test to wait on.
+
+    `stream_gate`: when given, every `/board/stream` connection is answered
+    with an empty keep-alive (and a short `retry:` so the client polls back
+    soon) for as long as `not stream_gate.is_set()`, checked fresh on each
+    connection — never any real frame. Once the test calls
+    `stream_gate.set()`, the next connection (at most one retry interval
+    later) gets the real frame-delivery behavior. This check is a plain
+    non-blocking `Event.is_set()`, called synchronously inside the route
+    callback: Playwright Python's sync API dispatches every route callback
+    on its one internal driver thread via a greenlet switch, so an actual
+    *block* here (`stream_gate.wait()`) — or fulfilling from a separate
+    thread to work around that — either freezes every other Playwright call
+    the test makes or raises `greenlet.error: Cannot switch to a different
+    thread` from `route.fulfill()`. Polling `is_set()` avoids both. Used to
+    prove a frame provably arrives only after a specific point in the test
+    (e.g. once a drawer is open and mid-edit) instead of racing page load on
+    a fixed timer (#850 round-2 finding 5). `board_stream_frames` (and
+    `board_state`, if the test wants the two to stay consistent) may be
+    mutated by the caller any time before calling `stream_gate.set()` — the
+    handler reads them fresh on the connection that delivers them.
+    """
+
+    def d3_handler(route):
+        route.fulfill(status=200, content_type="application/javascript", body="window.d3 = window.d3 || {};")
+
+    page.route("**/d3.v7.min.js", d3_handler)
+
+    if open_calls is None:
+        open_calls = []
+
+    stream_attempt = [0]
+
+    def api_handler(route):
+        url = route.request.url
+        method = route.request.method
+
+        if "/api/agents/board/stream" in url:
+            if stream_gate is not None and not stream_gate.is_set():
+                route.fulfill(status=200, content_type="text/event-stream", body="retry: 50\n: ok\n\n")
+                return
+            frame_idx = stream_attempt[0] - 1  # frames start on the 2nd post-gate connection
+            frame = board_stream_frames[frame_idx] if 0 <= frame_idx < len(board_stream_frames) else ""
+            stream_attempt[0] += 1
+            route.fulfill(status=200, content_type="text/event-stream", body=f"retry: 20\n: ok\n\n{frame}")
+            return
+
+        cancel_match = re.search(r"/api/agents/board/cards/([^/]+)/cancel$", url)
+        if cancel_match and method == "POST":
+            card_id = cancel_match.group(1)
+            if cancel_calls is not None:
+                cancel_calls.append(card_id)
+            _move_card_in_state(board_state, card_id, "done")
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] == card_id:
+                        card["status"] = "cancelled"
+            route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({
+                    "id": card_id, "lane": "done", "status": "cancelled", "tags": [],
+                    "killed": [], "failures": cancel_failures or [],
+                }),
+            )
+            return
+
+        open_match = re.search(r"/api/agents/board/cards/([^/]+)/open$", url)
+        if open_match and method == "POST":
+            open_calls.append(open_match.group(1))
+            if open_response and open_response.get("status", 200) != 200:
+                route.fulfill(
+                    status=open_response["status"],
+                    content_type="application/json",
+                    body=json.dumps({"detail": open_response.get("detail", "boom")}),
+                )
+            else:
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True}))
+            return
+
+        accept_match = re.search(r"/api/agents/board/cards/([^/]+)/accept$", url)
+        if accept_match and method == "POST":
+            card_id = accept_match.group(1)
+            _move_card_in_state(board_state, card_id, "done")
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] == card_id:
+                        card["status"] = "done"
+                        tags = [t for t in card.get("tags", []) if t != "agent-completed"]
+                        if "accepted" not in tags:
+                            tags.append("accepted")
+                        card["tags"] = tags
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": card_id, "lane": "done"}))
+            return
+
+        if re.search(r"/api/agents/models$", url) and method == "GET":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+            return
+
+        if re.search(r"/api/agents/hosts$", url) and method == "GET":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+            return
+
+        lane_match = re.search(r"/api/agents/board/cards/([^/]+)/lane$", url)
+        if lane_match and method == "PUT":
+            try:
+                body = json.loads(route.request.post_data or "{}")
+            except ValueError:
+                body = {}
+            lane_calls.append(body)
+            code = lane_status_code[0]
+            if code == 200:
+                # `lane_response`, when given, lets a test simulate the
+                # server landing a card somewhere other than the requested
+                # lane (e.g. a human_queue card that stays put on an
+                # assign) — one popped entry per successful PUT (#850
+                # round-3 finding 2a).
+                landed = lane_response.pop(0) if lane_response else body.get("lane")
+                _move_card_in_state(board_state, lane_match.group(1), landed)
+                # Mirror plan_lane_move's assignee bookkeeping: the drawer's
+                # assignee select PUTs `assignee` alongside `lane` (#859
+                # review round 2 finding 1) — a drag move omits the key
+                # entirely, so key on `"assignee" in body`, not truthiness,
+                # and also clear on an explicit move to unassigned.
+                if "assignee" in body or body.get("lane") == "unassigned":
+                    assignee = body.get("assignee")
+                    for cards in board_state["lanes"].values():
+                        for card in cards:
+                            if card["id"] != lane_match.group(1):
+                                continue
+                            others = [t for t in card.get("tags", []) if t.lower() not in _ASSIGNEE_TAGS]
+                            card["assignee"] = assignee or None
+                            card["tags"] = ([assignee] if assignee else []) + others
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": lane_match.group(1), "lane": landed}))
+            else:
+                route.fulfill(status=code, content_type="application/json", body=json.dumps({"detail": "boom"}))
+            return
+
+        if re.search(r"/api/tasks$", url) and method == "POST":
+            try:
+                body = json.loads(route.request.post_data or "{}")
+            except ValueError:
+                body = {}
+            if task_posts is not None:
+                task_posts.append(body)
+            new_id = f"new-{len(task_posts) if task_posts is not None else 1}"
+            tags = body.get("tags") or []
+            # Mirror derive_lane's default well enough for these UI-only
+            # tests (api/services/agent_board.py): no assignee tag ->
+            # Unassigned, an assignee tag -> Assigned. Full lane-derivation
+            # coverage lives in tests/test_agent_board.py.
+            assignee = tags[0] if tags else None
+            new_card = {
+                "kind": "task", "id": new_id, "title": body.get("description", ""),
+                "notes": body.get("notes") or "", "status": "todo",
+                "tags": tags, "assignee": assignee,
+                "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+                "session": None, "pending_question": None,
+            }
+            board_state["lanes"].setdefault("assigned" if assignee else "unassigned", []).append(new_card)
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": new_id, "description": new_card["title"]}))
+            return
+
+        task_match = re.search(r"/api/tasks/([^/]+)$", url)
+        if task_match and method == "PUT":
+            try:
+                body = json.loads(route.request.post_data or "{}")
+            except ValueError:
+                body = {}
+            task_puts.append(body)
+            # Mutate the fixture card the way a real PUT would, so a test
+            # that reopens the drawer to check a saved value doesn't see
+            # the stale fixture (mirrors _move_card_in_state; #859 trap 3).
+            task_id = task_match.group(1)
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] != task_id:
+                        continue
+                    if "fields" in body and isinstance(body["fields"], dict):
+                        fields = card.setdefault("fields", {})
+                        for key, value in body["fields"].items():
+                            if value is None:
+                                fields.pop(key, None)
+                            else:
+                                fields[key] = value
+                    if "notes" in body:
+                        card["notes"] = body["notes"]
+                    if "tags" in body:
+                        card["tags"] = body["tags"]
+                    if "context" in body:
+                        card["context"] = body["context"]
+                    if "description" in body:
+                        card["title"] = body["description"]
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": task_id}))
+            return
+
+        if task_match and method == "DELETE":
+            task_id = task_match.group(1)
+            if task_deletes is not None:
+                task_deletes.append(task_id)
+            if call_log is not None:
+                call_log.append(("task_delete", task_id))
+            _remove_card_from_state(board_state, task_id)
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"status": "deleted", "id": task_id}))
+            return
+
+        schedule_match = re.search(r"/api/scheduler/([^/]+)$", url)
+        if schedule_match and method == "PUT":
+            try:
+                body = json.loads(route.request.post_data or "{}")
+            except ValueError:
+                body = {}
+            schedule_puts.append(body)
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": schedule_match.group(1)}))
+            return
+
+        if schedule_match and method == "DELETE":
+            schedule_id = schedule_match.group(1)
+            if schedule_deletes is not None:
+                schedule_deletes.append(schedule_id)
+            if call_log is not None:
+                call_log.append(("schedule_delete", schedule_id))
+            _remove_card_from_state(board_state, schedule_id)
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"status": "deleted", "id": schedule_id}))
+            return
+
+        kill_match = re.search(r"/api/agents/sessions/([^/]+)/kill$", url)
+        if kill_match and method == "POST":
+            session_id = kill_match.group(1)
+            if kill_calls is not None:
+                kill_calls.append(session_id)
+            if call_log is not None:
+                call_log.append(("kill", session_id))
+            code = kill_status_code[0] if kill_status_code else 200
+            if code != 200:
+                route.fulfill(status=code, content_type="application/json", body=json.dumps({"detail": "boom"}))
+            else:
+                route.fulfill(
+                    status=200, content_type="application/json",
+                    body=json.dumps({
+                        "killed": [] if kill_failures else [session_id],
+                        "failures": kill_failures or [],
+                    }),
+                )
+            return
+
+        if re.search(r"/api/agents/board$", url) and method == "GET":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(board_state))
+            return
+
+        # Everything else the page might touch (pending-questions answer,
+        # session focus) — a harmless empty JSON body.
+        route.fulfill(status=200, content_type="application/json", body="{}")
+
+    page.route("**/api/**", api_handler)
+
+
+def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_puts=None, lane_status_code=None,
+                 schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None,
+                 open_calls=None, open_response=None, task_posts=None, cancel_calls=None, cancel_failures=None,
+                 kill_calls=None, kill_status_code=None, kill_failures=None,
+                 task_deletes=None, schedule_deletes=None, call_log=None):
+    _stub_routes(
+        page,
+        board_state if board_state is not None else _board_fixture(),
+        lane_calls if lane_calls is not None else [],
+        task_puts if task_puts is not None else [],
+        lane_status_code if lane_status_code is not None else [200],
+        schedule_puts if schedule_puts is not None else [],
+        board_stream_frames if board_stream_frames is not None else [],
+        stream_gate,
+        lane_response,
+        open_calls,
+        open_response,
+        task_posts,
+        cancel_calls,
+        cancel_failures,
+        kill_calls,
+        kill_status_code,
+        kill_failures,
+        task_deletes,
+        schedule_deletes,
+        call_log,
+    )
+    page.goto(f"{base_url}/agents")
+    page.wait_for_selector('[data-card-id="t1"]')
+
+
+# Canonical lane order — mirrors web/agents/board.js's LANES.
+LANE_IDS = ["unassigned", "assigned", "in_progress", "human_queue", "scheduled", "review", "done"]
+DEFAULT_VISIBLE_LANE_IDS = [lane_id for lane_id in LANE_IDS if lane_id != "done"]
+
+
+def _seed_lane_storage(page: Page, raw_value: str):
+    """Pre-seed the lane-filter localStorage key (web/agents/board.js's
+    LANE_FILTER_STORAGE_KEY) before the page's own scripts run. Must be
+    called before `_open_board`/`page.goto`, since `add_init_script` only
+    affects future navigations."""
+    page.add_init_script(f"window.localStorage.setItem('lifeos.agents.board.lanes', {json.dumps(raw_value)});")
+
+
+def _check_only_lanes(page: Page, lane_ids):
+    """Drive the lane-filter dropdown to show exactly `lane_ids`."""
+    page.locator("#board-lane-filter-btn").click()
+    for cb in page.locator("#board-lane-filter-options input[type='checkbox']").all():
+        if cb.get_attribute("value") in lane_ids:
+            cb.check()
+        else:
+            cb.uncheck()
+
+
+def _wait_for(predicate, page: Page, timeout_ms=5000, interval_ms=25):
+    """Poll `predicate` until it's truthy or the timeout elapses — for
+    asserting on a plain Python side effect (e.g. an appended stub call)
+    that has no DOM signal Playwright's own `expect(...)` can wait on.
+
+    `page` is required: Playwright Python's sync API only advances its
+    internal event loop — and so only delivers an already-arrived
+    intercepted request's route callback — from inside a call back into
+    Playwright, via a greenlet switch tied to the calling thread. A pure
+    `time.sleep()` poll never makes such a call, so a route callback that
+    already landed can sit undelivered for the whole timeout regardless of
+    what else is happening on the page. `page.wait_for_timeout(...)` is
+    itself a Playwright call, so using it as the poll's sleep also serves
+    as the pump — no separate `evaluate()` + `time.sleep()` pair needed."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        page.wait_for_timeout(interval_ms)
+    assert predicate(), f"condition not met within {timeout_ms}ms"
+
+
+def _drag_card(page: Page, card_id: str, target_lane: str):
+    card = page.locator(f'[data-card-id="{card_id}"]')
+    card_box = card.bounding_box()
+    lane_cards = page.locator(f'.board-lane[data-lane="{target_lane}"] .board-lane-cards')
+    lane_box = lane_cards.bounding_box()
+    page.mouse.move(card_box["x"] + card_box["width"] / 2, card_box["y"] + card_box["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(lane_box["x"] + lane_box["width"] / 2, lane_box["y"] + 15, steps=10)
+    page.mouse.move(lane_box["x"] + lane_box["width"] / 2, lane_box["y"] + 15, steps=1)
+    page.mouse.up()
+
+
+class TestBoardLoad:
+    def test_cards_render_in_their_derived_lanes(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t2"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t3"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t4"]')).to_be_visible()
+
+    def test_pending_question_shown_on_card(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        card = page.locator('[data-card-id="t3"]')
+        expect(card.locator(".board-card-question")).to_contain_text("Which environment?")
+
+    def test_lane_headers_carry_the_shared_lane_colour_accent(self, page: Page, agents_base_url):
+        """Each lane header's `border-top-color` equals `laneColor(lane.id)`
+        (web/agents/lanes.js) — the same palette the graph tab uses for its
+        node fill, so the board and graph read as one system."""
+        _open_board(page, agents_base_url)
+        result = page.evaluate(
+            """async () => {
+                const { laneColor } = await import('/static/agents/lanes.js');
+                const normalize = (hex) => {
+                    const probe = document.createElement('div');
+                    probe.style.color = hex;
+                    document.body.appendChild(probe);
+                    const rgb = getComputedStyle(probe).color;
+                    probe.remove();
+                    return rgb;
+                };
+                return Array.from(document.querySelectorAll('.board-lane')).map(el => ({
+                    lane: el.dataset.lane,
+                    actual: getComputedStyle(el.querySelector('.board-lane-header')).borderTopColor,
+                    expected: normalize(laneColor(el.dataset.lane)),
+                }));
+            }"""
+        )
+        assert len(result) >= 2
+        for row in result:
+            assert row["actual"] == row["expected"], row
+
+
+class TestDragBetweenLanes:
+    def test_drag_issues_lane_put_with_expected_body(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[200])
+        _drag_card(page, "t1", "in_progress")
+        # A successful move re-fetches the board; wait for the card to land
+        # in its new lane rather than asserting on a fixed delay.
+        expect(page.locator('.board-lane[data-lane="in_progress"] [data-card-id="t1"]')).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "in_progress"}]
+
+    def test_failed_move_does_not_move_card_and_shows_toast(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[500])
+        _drag_card(page, "t1", "in_progress")
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        # Card is still where it started — the failed PUT never re-fetched
+        # the board, so nothing moved.
+        expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="in_progress"] [data-card-id="t1"]')).to_have_count(0)
+        assert lane_calls == [{"lane": "in_progress"}]
+
+    def test_dropping_on_assigned_lane_defaults_assignee_to_me(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[200])
+        _drag_card(page, "t1", "assigned")
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t1"]')).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "assigned", "assignee": "me"}]
+
+
+class TestDrawerNotesEdit:
+    def test_editing_notes_and_blurring_saves(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        expect(notes).to_be_visible()
+        notes.fill("Updated notes from the drawer")
+        page.locator(".drawer-title").click()  # blur the notes field
+        expect(page.locator(".drawer-notes")).to_have_value("Updated notes from the drawer")
+        assert any(p.get("notes") == "Updated notes from the drawer" for p in task_puts), task_puts
+
+
+class TestDrawerTagsEdit:
+    def test_invalid_and_assignee_tokens_are_dropped(self, page: Page, agents_base_url):
+        """Round-1 finding 8: the Tags field must not let a vault-comment
+        injection or a duplicate assignee token reach the task store. t2 is
+        assigned #me — typing an assignee token, a plain word, and an
+        HTML-comment-shaped token must save only the plain word alongside
+        the real assignee tag."""
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_be_visible()
+        tags.fill("codex foo <!--id:abc-->")
+        page.locator(".drawer-title").click()  # blur the tags field
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(tags).to_have_value("foo")
+        assert any(
+            sorted(p.get("tags") or []) == ["foo", "me"] for p in task_puts
+        ), task_puts
+        assert not any("<" in t for p in task_puts for t in (p.get("tags") or []))
+        assert not any("codex" in (p.get("tags") or []) for p in task_puts)
+
+
+class TestDrawerAssigneeRevert:
+    def test_failed_assignee_change_snaps_select_back(self, page: Page, agents_base_url):
+        """Round-1 finding 9: a rejected assignee change (the lane PUT 409s)
+        must not leave the unsaved value showing in the select."""
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[500])
+        page.locator('[data-card-id="t2"]').click()
+        assignee = page.locator(".drawer-assignee")
+        expect(assignee).to_have_value("me")
+        assignee.select_option("codex")
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(assignee).to_have_value("me")
+        assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
+
+
+class TestScheduledCardDrawer:
+    def test_editing_title_message_and_enabled_all_save_through_scheduler_api(self, page: Page, agents_base_url):
+        """Round-1 finding 4: the scheduled card's title, message, and
+        enabled checkbox save through PUT /api/scheduler/{id}, not a new
+        board write path. Round-2 finding 9: the docstring claimed all
+        three but only title was ever exercised — the message textarea's
+        blur handler and the enabled checkbox's change handler
+        (web/agents/board.js) were untested."""
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        page.locator('[data-card-id="s1"]').click()
+        title = page.locator(".drawer-title")
+        message = page.locator(".drawer-notes")
+        enabled = page.locator('[data-field="enabled"]')
+        expect(title).to_have_value("Morning briefing")
+        title.fill("Evening briefing")
+        message.click()  # blur the title field
+        expect(message).to_have_value("Good morning")
+        _wait_for(lambda: {"name": "Evening briefing"} in schedule_puts, page=page)
+
+        # Blur message straight into the checkbox (never back through title —
+        # title's own blur handler compares against the value captured when
+        # its DOM node was created, and staying focused inside the drawer
+        # deliberately skips re-rendering it (#850 round-2 finding 4), so a
+        # second title blur here would re-save the same unchanged value).
+        message.fill("Good evening")
+        expect(enabled).to_be_checked()
+        enabled.uncheck()  # blurs message, then toggles enabled
+        _wait_for(lambda: {"message_content": "Good evening"} in schedule_puts, page=page)
+        _wait_for(lambda: {"enabled": False} in schedule_puts, page=page)
+
+        assert schedule_puts == [
+            {"name": "Evening briefing"},
+            {"message_content": "Good evening"},
+            {"enabled": False},
+        ]
+
+
+class TestLiveUpdates:
+    """Round-1 finding 12(b): the SSE live-update path itself was never
+    driven by a browser test — the stub only ever sent the empty ": ok"
+    comment. These deliver a real "event: board" frame on a reconnect."""
+
+    def test_board_frame_moves_a_card_with_no_navigation(self, page: Page, agents_base_url):
+        """#862: withhold the frame behind `stream_gate` (see the sibling
+        drawer tests below) so the "still in unassigned" assertion can't
+        lose a race with the stub's `retry: 20` reconnect on a slow first
+        paint — previously flaky (measured 6/30 and 3/30 in #860's
+        verification) because that frame could already have landed by the
+        time the first assertion polled."""
+        stream_gate = threading.Event()
+        moved_board = copy.deepcopy(_board_fixture())
+        _move_card_in_state(moved_board, "t1", "in_progress")
+        frame = f"event: board\ndata: {json.dumps(moved_board)}\n\n"
+
+        _open_board(page, agents_base_url, board_stream_frames=[frame], stream_gate=stream_gate)
+        expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
+
+        url_before = page.url
+        stream_gate.set()
+        expect(page.locator('.board-lane[data-lane="in_progress"] [data-card-id="t1"]')).to_be_visible(timeout=8000)
+        expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_have_count(0)
+        assert page.url == url_before  # no page reload/navigation happened
+
+    def test_drawer_notes_survive_a_board_frame_while_typing_and_flushes_on_blur(self, page: Page, agents_base_url):
+        """Round-2 finding 5 (reworks round-1 finding 12(b)'s test, which was
+        a false positive): the prior version delivered its frame on the
+        stub's *second* SSE connection, which — thanks to the `retry: 20`
+        reconnect — landed ~20ms after page load, before the drawer was
+        even opened. The guarded path (updateOpenDrawer's `!focused` check,
+        #850 round-2 finding 4) was therefore never entered; the test
+        passed even with that check deleted.
+
+        This version withholds every `/board/stream` response behind a
+        Python-side `threading.Event` the route handler polls non-blockingly
+        (`stream_gate` — see `_stub_routes`'s docstring for why an actual
+        block would deadlock Playwright's driver thread), so the frame
+        provably cannot arrive until the test releases it — after the
+        drawer is open and mid-edit. It also
+        changes a field on a DIFFERENT card (t1) so there's an unambiguous,
+        drawer-independent signal that the frame was actually applied."""
+        stream_gate = threading.Event()
+        board_state = _board_fixture()
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        title = page.locator(".drawer-title")
+        expect(notes).to_be_visible()
+        expect(title).to_have_value("Ship the release")
+        notes.fill("typed while a tick arrives")  # focus stays in the notes field
+
+        # Mutate the board (a tag on a DIFFERENT card, t1; a title change on
+        # the OPEN card, t2) and only now let the withheld stream connection
+        # respond — proving the frame arrives after this point, not before.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t2":
+                card["title"] = "Ship the release (renamed in the vault)"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        # Proof the frame was actually applied: an unrelated card (t1, not
+        # open in the drawer) picks up its new tag chip in the lane view,
+        # which render() always rebuilds regardless of drawer focus.
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text(
+            "urgent", timeout=5000,
+        )
+
+        # The open card's drawer must NOT have rebuilt while notes had focus
+        # — the typed text survived, and the title hasn't flushed yet.
+        expect(notes).to_have_value("typed while a tick arrives")
+        expect(title).to_have_value("Ship the release")
+
+        # Leaving the field (not just moving within the drawer — activeElement
+        # must actually leave drawerEl) flushes the deferred change.
+        page.evaluate("() => document.activeElement.blur()")
+        expect(title).to_have_value("Ship the release (renamed in the vault)")
+
+    def test_deferred_frame_flushes_when_focus_leaves_drawer_without_an_edit(self, page: Page, agents_base_url):
+        """#850 round-3 finding 1: the drawerEl `focusout` listener itself
+        must flush a deferred render once focus actually leaves the drawer
+        (blur() to <body>), independent of any field edit. Clicking into
+        notes WITHOUT typing means the notes blur handler's own
+        short-circuit (`value === card.notes`) never fires a PUT or
+        fetchBoard() — the ONLY path left that can flush the deferred
+        frame is the focusout listener. This isolates that listener from
+        the sibling test above, which types text and so is flushed by the
+        notes PUT's own fetchBoard(), never by the listener (verified by
+        temporarily deleting the listener: this test fails, the sibling
+        test above still passes)."""
+        stream_gate = threading.Event()
+        board_state = _board_fixture()
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        title = page.locator(".drawer-title")
+        expect(notes).to_be_visible()
+        expect(title).to_have_value("Ship the release")
+        notes.click()  # focus only, no typing
+
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t2":
+                card["title"] = "Ship the release (renamed in the vault)"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        # Proof the frame was actually applied: an unrelated card (t1)
+        # picks up its new tag chip in the lane view.
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text(
+            "urgent", timeout=5000,
+        )
+        # Still deferred: the open card's drawer hasn't rebuilt yet.
+        expect(title).to_have_value("Ship the release")
+
+        page.evaluate("() => document.activeElement.blur()")
+        expect(title).to_have_value("Ship the release (renamed in the vault)")
+
+    def test_action_button_click_survives_a_deferred_frame(self, page: Page, agents_base_url):
+        """#850 round-3 finding 1: without a `relatedTarget` guard on the
+        focusout listener, mousedown on a drawer action button fires
+        focusout while `document.activeElement` is briefly <body> (focus
+        hasn't landed on the button yet). If a deferred frame is pending at
+        that instant, the drawer gets rebuilt via innerHTML between
+        mousedown and mouseup — the click lands on a now-detached node and
+        the Answer composer never opens."""
+        stream_gate = threading.Event()
+        board_state = _board_fixture()
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t3"]').click()  # t3: pending_question id 1
+        notes = page.locator(".drawer-notes")
+        answer_btn = page.get_by_role("button", name="Answer")
+        expect(notes).to_be_visible()
+        expect(answer_btn).to_be_visible()
+        notes.click()  # focus only, no typing
+
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["human_queue"]:
+            if card["id"] == "t3":
+                card["title"] = "Debug prod issue (renamed)"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        # Proof the frame landed (drawer-independent signal).
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text(
+            "urgent", timeout=5000,
+        )
+
+        answer_btn.click()
+        expect(page.locator("#answer-title")).to_be_visible(timeout=3000)
+
+    def test_lane_mismatch_toast_shows_landed_lane(self, page: Page, agents_base_url):
+        """#850 round-2 finding 2b, untested until now: when the server
+        lands a card in a different lane than requested (e.g. a
+        human_queue card that stays put on an assign attempt), the client
+        must toast the actual landed lane instead of leaving the operator
+        to notice the card "snapped back" on its own."""
+        lane_calls = []
+        _open_board(
+            page, agents_base_url, lane_calls=lane_calls,
+            lane_response=["human_queue"],
+        )
+        _drag_card(page, "t4", "assigned")
+        expect(page.locator(".toast")).to_contain_text("landed in Human queue", timeout=5000)
+        assert lane_calls == [{"lane": "assigned", "assignee": "me"}]
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t4"]')).to_be_visible()
+
+    def test_stale_answer_button_cleared_when_pending_question_resolves(self, page: Page, agents_base_url):
+        """#850 round-2 finding 3, untested until now: when a card's
+        pending_question is cleared elsewhere (the agent gets an answer
+        via another channel), the open drawer must swap out the stale
+        Answer button rather than leaving it behind for a second click
+        that would 404."""
+        stream_gate = threading.Event()
+        board_state = _board_fixture()
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t3"]').click()  # t3: pending_question id 1, human_queue
+        expect(page.get_by_role("button", name="Answer")).to_be_visible()
+        expect(page.get_by_role("button", name="Resolve")).to_have_count(0)
+
+        for card in board_state["lanes"]["human_queue"]:
+            if card["id"] == "t3":
+                card["pending_question"] = None
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(page.get_by_role("button", name="Answer")).to_have_count(0, timeout=5000)
+        expect(page.get_by_role("button", name="Resolve")).to_be_visible()
+
+    def test_kill_button_cleared_when_linked_session_reaches_terminal_status(self, page: Page, agents_base_url):
+        """#850 round-2 finding 3's other half (round-4 finding 1): when the
+        card's linked session reaches a terminal status elsewhere (e.g. the
+        CLI process exits on its own), the open drawer must drop the stale
+        Kill button rather than leaving it behind for a click that would
+        404. Every card in _board_fixture() has session: None, so this half
+        of updateOpenDrawer's `prevSessionStatus !== freshSessionStatus`
+        clause (web/agents/board.js) was never exercised by any test."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_stream_frames: list[str] = []
+
+        for card in board_state["lanes"]["human_queue"]:
+            if card["id"] == "t3":
+                card["session"] = {
+                    "session_id": "s-t3", "status": "running",
+                    "host": "test-host", "routing": "claude_code",
+                    "model_label": "Sonnet", "source": "claude_code",
+                }
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t3"]').click()  # t3: pending_question id 1, human_queue
+        expect(page.get_by_role("button", name="Kill")).to_be_visible()
+
+        for card in board_state["lanes"]["human_queue"]:
+            if card["id"] == "t3":
+                card["session"]["status"] = "ended"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(page.get_by_role("button", name="Kill")).to_have_count(0, timeout=5000)
+
+
+class TestFilters:
+    def test_assignee_me_shows_only_me_cards(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator("#board-filter-assignee").select_option("me")
+        expect(page.locator('[data-card-id="t2"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t4"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t3"]')).to_have_count(0)
+
+    def test_lane_human_queue_shows_both_agent_and_human_cards(self, page: Page, agents_base_url):
+        """The lane filter is a multi-select — isolate to a single
+        lane by unchecking every other one."""
+        _open_board(page, agents_base_url)
+        _check_only_lanes(page, {"human_queue"})
+        expect(page.locator('[data-card-id="t3"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t4"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
+
+    def test_lane_human_queue_and_assignee_me_shows_only_human_card(self, page: Page, agents_base_url):
+        """AC: 'Filtering by lane Human queue and assignee me together shows
+        only #human cards.' t3 is agent-blocked/assignee=codex; t4 is the
+        #human card, tagged #me — only t4 should remain. Lane isolation
+        goes through the multi-select checkbox dropdown."""
+        _open_board(page, agents_base_url)
+        _check_only_lanes(page, {"human_queue"})
+        page.locator("#board-filter-assignee").select_option("me")
+        expect(page.locator('[data-card-id="t4"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t3"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
+
+    def test_cancelled_cards_hidden_behind_filter_in_shown_done_lane(self, page: Page, agents_base_url):
+        """The "include cancelled" checkbox only hides
+        cancelled cards — the Done lane itself (finished tasks) stays
+        visible whether it's checked or not, once its column is shown.
+        Done is unchecked by default in the lane filter (covered by
+        TestLaneFilterMultiSelect); this test is about the
+        "include cancelled" filter within a shown Done column, so it checks
+        Done explicitly first."""
+        _open_board(page, agents_base_url)
+        _check_only_lanes(page, set(DEFAULT_VISIBLE_LANE_IDS) | {"done"})
+        expect(page.locator('[data-card-id="t5"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t6"]')).to_have_count(0)
+        page.locator("#board-filter-done").check()
+        expect(page.locator('[data-card-id="t5"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t6"]')).to_be_visible()
+
+    def test_search_filters_by_title(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator("#board-search").fill("outage")
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t3"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t4"]')).to_have_count(0)
+
+    def test_tag_filter(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator("#board-filter-tag").fill("codex")
+        expect(page.locator('[data-card-id="t3"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t4"]')).to_have_count(0)
+
+    def test_context_filter_control_removed(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        expect(page.locator("#board-filter-context")).to_have_count(0)
+
+    def test_clear_filters_resets_row(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator("#board-search").fill("outage")
+        page.locator("#board-filter-assignee").select_option("me")
+        page.locator("#board-filter-tag").fill("codex")
+        page.locator("#board-filter-sort").select_option("created_desc")
+        page.locator("#board-filter-clear").click()
+        expect(page.locator("#board-search")).to_have_value("")
+        expect(page.locator("#board-filter-assignee")).to_have_value("all")
+        expect(page.locator("#board-filter-tag")).to_have_value("")
+        expect(page.locator("#board-filter-sort")).to_have_value("file")
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+
+    def test_sort_by_assignee_orders_lane(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"] = [
+            {
+                "kind": "task", "id": "ta", "title": "A card",
+                "notes": "", "status": "todo", "tags": ["codex"], "assignee": "codex",
+                "fields": {}, "context": "Inbox", "created_date": "2026-01-02",
+                "updated_at": "2026-01-02T00:00:00+00:00",
+                "session": None, "pending_question": None,
+            },
+            {
+                "kind": "task", "id": "tb", "title": "B card",
+                "notes": "", "status": "todo", "tags": ["claude"], "assignee": "claude",
+                "fields": {}, "context": "Inbox", "created_date": "2026-01-01",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "session": None, "pending_question": None,
+            },
+        ]
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator("#board-filter-sort").select_option("assignee_asc")
+        ids = page.locator('.board-lane[data-lane="assigned"] .board-card').evaluate_all(
+            "els => els.map(e => e.dataset.cardId)"
+        )
+        assert ids == ["tb", "ta"]
+
+    def test_review_card_accept_without_drawer(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"] = [{
+            "kind": "task", "id": "tr", "title": "Ready for review",
+            "notes": "", "status": "done", "tags": ["agent-completed", "hermes"],
+            "assignee": "hermes", "fields": {}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        }]
+        _open_board(page, agents_base_url, board_state=board_state)
+        # Review is visible by default
+        card = page.locator('[data-card-id="tr"]')
+        expect(card.locator(".board-card-accept")).to_be_visible()
+        card.locator(".board-card-accept").click()
+        expect(page.locator('.board-lane[data-lane="review"] [data-card-id="tr"]')).to_have_count(0)
+        assert any(card["id"] == "tr" for card in board_state["lanes"]["done"])
+
+    def test_assignee_filter_lists_cloud(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        options = page.locator("#board-filter-assignee option").evaluate_all(
+            "els => els.map(e => e.value)"
+        )
+        assert "cloud" in options
+
+    def test_drag_sets_board_dragging_class(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        card = page.locator('[data-card-id="t1"]')
+        box = card.bounding_box()
+        assert box
+        page.mouse.move(box["x"] + 5, box["y"] + 5)
+        page.mouse.down()
+        page.mouse.move(box["x"] + 40, box["y"] + 40, steps=5)
+        assert page.evaluate("() => document.body.classList.contains('board-dragging')")
+        page.mouse.up()
+        assert not page.evaluate("() => document.body.classList.contains('board-dragging')")
+
+
+class TestHostAssignmentChipAndFilter:
+    """fields.host (the assignment — where a card WILL run, written by the
+    drawer's host dropdown) is surfaced as its own chip on the card face,
+    distinct from the session.host "ran on" chip, and the host filter's
+    option list and matching union both fields instead of reading
+    session.host alone."""
+
+    def _board_with_host_cards(self):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            # Assigned to a non-API host, no session yet — assignment chip
+            # only; also the sole card whose only host is an
+            # assignment-only host ("build-box-2" never appears as any
+            # card's session.host), so it proves the filter's union.
+            "kind": "task", "id": "t8", "title": "Assigned but not yet run",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"host": "build-box-2"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_state["lanes"]["assigned"].append({
+            # Assigned to the API host itself — "this machine", not
+            # "another" host, so no assignment chip; no session either.
+            "kind": "task", "id": "t9", "title": "Assigned to the API host itself",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"host": board_state["api_host"]}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_state["lanes"]["assigned"].append({
+            # Assigned to one host, ran on another — both chips render.
+            "kind": "task", "id": "t10", "title": "Assigned elsewhere, ran somewhere else",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"host": "build-box-3"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t10", "status": "completed",
+                "host": "build-box-4", "routing": "claude_code",
+            },
+            "pending_question": None,
+        })
+        board_state["lanes"]["assigned"].append({
+            # Assigned to a host, ran on that same host — the duplicate
+            # case: exactly one chip (the assigned-host chip) renders, not
+            # both.
+            "kind": "task", "id": "t11", "title": "Assigned and ran on the same host",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"host": "build-box-5"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t11", "status": "completed",
+                "host": "build-box-5", "routing": "claude_code",
+            },
+            "pending_question": None,
+        })
+        board_state["lanes"]["assigned"].append({
+            # No assignment at all, but a linked session ran somewhere —
+            # the ran-on chip renders on its own, with no assignment chip
+            # to suppress it.
+            "kind": "task", "id": "t12", "title": "No assignment, but a session ran",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t12", "status": "completed",
+                "host": "build-box-6", "routing": "claude_code",
+            },
+            "pending_question": None,
+        })
+        return board_state
+
+    def test_assigned_host_chip_renders_distinctly_from_ran_on_chip(self, page: Page, agents_base_url):
+        board_state = self._board_with_host_cards()
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        assigned = page.locator('[data-card-id="t8"] .board-chip-assigned-host')
+        expect(assigned).to_have_text("build-box-2")
+        expect(page.locator('[data-card-id="t8"] .board-chip-host')).to_have_count(0)
+
+        expect(page.locator('[data-card-id="t9"] .board-chip-assigned-host')).to_have_count(0)
+        expect(page.locator('[data-card-id="t9"] .board-chip-host')).to_have_count(0)
+
+        # Baseline fixture card: no host field at all -> no host chip.
+        expect(page.locator('[data-card-id="t1"] .board-chip-assigned-host')).to_have_count(0)
+        expect(page.locator('[data-card-id="t1"] .board-chip-host')).to_have_count(0)
+
+        expect(page.locator('[data-card-id="t10"] .board-chip-assigned-host')).to_have_text("build-box-3")
+        expect(page.locator('[data-card-id="t10"] .board-chip-host')).to_have_text("build-box-4")
+
+        # t11: assigned to and ran on the same host -> exactly one chip,
+        # the assigned-host chip, reading that name; the ran-on chip is
+        # suppressed rather than repeating it.
+        expect(page.locator('[data-card-id="t11"] .board-chip-assigned-host')).to_have_text("build-box-5")
+        expect(page.locator('[data-card-id="t11"] .board-chip-host')).to_have_count(0)
+        expect(page.locator('[data-card-id="t11"] .board-chip-assigned-host, [data-card-id="t11"] .board-chip-host')).to_have_count(1)
+
+        # t12: no assignment, but a linked session ran -> the ran-on chip
+        # still renders (no assignment chip was rendered to suppress it).
+        expect(page.locator('[data-card-id="t12"] .board-chip-assigned-host')).to_have_count(0)
+        expect(page.locator('[data-card-id="t12"] .board-chip-host')).to_have_text("build-box-6")
+
+    def test_host_filter_options_include_an_assignment_only_host(self, page: Page, agents_base_url):
+        board_state = self._board_with_host_cards()
+        _open_board(page, agents_base_url, board_state=board_state)
+        values = page.locator("#board-filter-host option").evaluate_all("els => els.map(e => e.value)")
+        assert "build-box-2" in values, values
+
+    def test_host_filter_matches_assignment_or_session_and_leaves_lanes_intact(self, page: Page, agents_base_url):
+        page.set_viewport_size({"width": 1280, "height": 800})
+        board_state = self._board_with_host_cards()
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        page.locator("#board-filter-host").select_option("build-box-2")
+        expect(page.locator('[data-card-id="t8"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t10"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
+
+        # "build-box-4" only ever appears as t10's session host — selecting
+        # it exercises the observation half of the match.
+        page.locator("#board-filter-host").select_option("build-box-4")
+        expect(page.locator('[data-card-id="t10"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t8"]')).to_have_count(0)
+
+        # Filtering leaves the lane layout intact at 1280x800:
+        # the page never grows a horizontal scrollbar, and every lane
+        # column filtering left on screen still has real width rather than
+        # collapsing to zero. `body` has `overflow: hidden` and #board-lanes
+        # is the element that actually carries `overflow-x: auto`, so it
+        # (not document.documentElement, which never grows past the
+        # viewport no matter how wide the lanes get) is where a real
+        # overflow would show up.
+        scroll_width, client_width = page.locator("#board-lanes").evaluate(
+            "el => [el.scrollWidth, el.clientWidth]"
+        )
+        assert scroll_width == client_width, (scroll_width, client_width)
+        lane_widths = page.locator(".board-lane").evaluate_all(
+            "els => els.map(e => e.getBoundingClientRect().width)"
+        )
+        assert lane_widths, "no lane columns rendered"
+        assert all(w > 0 for w in lane_widths), lane_widths
+
+
+class TestTabSwitching:
+    """#850 verify-1 findings 1 and 2: `#board-view { display: flex }`
+    (specificity 1-0-0) and `.chips { display: flex }` (0-1-0) each beat
+    the generic `[hidden]` rule they were relying on, so setting
+    `.hidden = true` on either element never actually hid it. Assert on
+    COMPUTED style, not element reachability — Playwright's own visibility
+    helpers auto-scroll to an element, which hid this bug from every prior
+    test."""
+
+    def _computed_display(self, page: Page, selector: str) -> str:
+        return page.evaluate(
+            "(sel) => getComputedStyle(document.querySelector(sel)).display", selector,
+        )
+
+    def test_graph_tab_hides_board_view_and_chips_and_back(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        assert self._computed_display(page, "#board-view") != "none"
+        assert self._computed_display(page, "#graph-chips") == "none"
+
+        page.locator("#tab-btn-graph").click()
+        expect(page.locator("#graph-view")).to_be_visible()
+        assert self._computed_display(page, "#board-view") == "none"
+        assert self._computed_display(page, "#graph-chips") != "none"
+
+        page.locator("#tab-btn-board").click()
+        expect(page.locator("#board-view")).to_be_visible()
+        assert self._computed_display(page, "#board-view") != "none"
+        assert self._computed_display(page, "#graph-chips") == "none"
+
+
+class TestDragThenClick:
+    """#850 verify-1 finding 3: `suppressNextClick` was cleared only inside
+    the card's own click handler, but a drop's re-render replaces every
+    card node and the drag's trailing click often lands on a different
+    element (the drop target lane), so it never reaches that handler — the
+    flag then lingers and swallows the operator's NEXT genuine click on the
+    same card id. Reproduced for both the success path and a rejected
+    (409) move, matching what the verify agent observed live."""
+
+    def test_click_after_successful_drag_opens_drawer(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[200])
+        _drag_card(page, "t1", "in_progress")
+        expect(page.locator('.board-lane[data-lane="in_progress"] [data-card-id="t1"]')).to_be_visible(timeout=5000)
+
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Investigate outage")
+
+    def test_click_after_rejected_drag_opens_drawer(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[409])
+        _drag_card(page, "t1", "in_progress")
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        # The rejected move re-renders in place — card never left "unassigned".
+        expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
+
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Investigate outage")
+
+
+def _hold_task_field_puts(page: Page, task_puts: list, board_state: dict):
+    """Intercept `PUT /api/tasks/{id}` ahead of `_stub_routes`'s generic
+    handler and hold each one un-fulfilled until the test releases it —
+    lets a test keep a picker save "in flight" for as long as it needs
+    before deciding whether it lands or is rejected, rather than
+    resolving synchronously the way the generic stub does. Registered
+    after `_open_board`, so Playwright tries it first (the most recently
+    registered matching handler runs first); every request the handler
+    itself doesn't hold falls through to the generic stub via
+    `route.fallback()`.
+
+    Returns `(held, release)`: `held` is a list of `(route, task_id,
+    body)` tuples, one per PUT that arrived, in arrival order — a test
+    reads its length to prove a save actually reached the network before
+    driving the race it wants. `release(index, status=200, detail=None)`
+    fulfills that held PUT — a 200 also merges `body["fields"]` into
+    `board_state` the same way the generic stub does, so a later
+    `GET /api/agents/board` (a save's own `onSaved` callback triggers a
+    `fetchBoard()`) reflects it; any other status returns `{"detail":
+    ...}` without mutating the board, mirroring a rejected save."""
+    held: list = []
+
+    def handler(route):
+        req = route.request
+        match = re.search(r"/api/tasks/([^/]+)$", req.url)
+        if not (match and req.method == "PUT"):
+            route.fallback()
+            return
+        body = json.loads(req.post_data or "{}")
+        task_puts.append(body)
+        held.append((route, match.group(1), body))
+
+    page.route("**/api/tasks/**", handler)
+
+    def release(index=0, *, status=200, detail=None):
+        route, task_id, body = held[index]
+        if status == 200:
+            if "fields" in body and isinstance(body["fields"], dict):
+                for cards in board_state["lanes"].values():
+                    for card in cards:
+                        if card["id"] != task_id:
+                            continue
+                        fields = card.setdefault("fields", {})
+                        for key, value in body["fields"].items():
+                            if value is None:
+                                fields.pop(key, None)
+                            else:
+                                fields[key] = value
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": task_id}))
+        else:
+            route.fulfill(status=status, content_type="application/json", body=json.dumps({"detail": detail or "boom"}))
+
+    return held, release
+
+
+class TestAssignmentPickers:
+    """#859: web/agents/assignment.js's model/effort/host pickers mounted
+    into the task drawer. t7 (assignee claude, lane Assigned) is the fixture
+    card for these — t2's assignee "me" can't drive the module's own engine
+    select (it only knows claude/codex/local/hermes)."""
+
+    def test_pickers_render_from_model_catalog_with_engine_row_hidden(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t7"]').click()
+        assignment = page.locator(".drawer-assignment")
+        expect(assignment).to_be_visible()
+        # The drawer's OWN Assignee select stays the one assignee writer —
+        # the module's engine row must be hidden, not removed, to avoid a
+        # second, conflicting assignee control.
+        expect(assignment.locator('[data-row="engine"]')).to_be_hidden()
+        expect(assignment.locator('[data-row="model"]')).to_be_visible()
+        expect(assignment.locator('[data-row="effort"]')).to_be_visible()
+        expect(assignment.locator('[data-row="host"]')).to_be_visible()
+        # Model options populate asynchronously once GET /api/agents/models
+        # resolves — default + 2 claude models from _MODEL_CATALOG.
+        expect(assignment.locator("[data-field='model'] option")).to_have_count(3)
+
+    def test_pickers_hidden_for_me_assignee(self, page: Page, agents_base_url):
+        # t2 is assignee "me" — the module's ENGINES list (claude/codex/
+        # local/hermes) has no "me" entry, so its engine select falls back
+        # to no selection and none of model/effort/host accept it.
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        assignment = page.locator(".drawer-assignment")
+        expect(assignment).to_be_attached()
+        expect(assignment.locator('[data-row="model"]')).to_be_hidden()
+        expect(assignment.locator('[data-row="effort"]')).to_be_hidden()
+        expect(assignment.locator('[data-row="host"]')).to_be_hidden()
+
+    def test_assignee_change_with_focus_held_remounts_pickers_and_open(self, page: Page, agents_base_url):
+        """#859 review round 1 finding 1: a native <select> keeps focus
+        after firing `change`, so `updateOpenDrawer`'s `!focused` check
+        would otherwise skip the rebuild and leave the pickers/Open button
+        hidden until focus later left the drawer. board.js's assignee
+        handler must re-render explicitly on its success path
+        (web/agents/board.js ~L649-657) — drive the select directly (no
+        `select_option`, which itself blurs) and assert with no click
+        outside the drawer."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Investigate outage")
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'claude'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_be_visible()
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_have_count(1)
+        expect(page.get_by_role("button", name="Open")).to_be_visible()
+        expect(page.get_by_role("button", name="Open")).to_have_count(1)
+
+    def test_changing_model_writes_exactly_one_fields_put(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t7"]').click()
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        expect(model_select.locator("option")).to_have_count(3)
+        model_select.select_option("claude-sonnet-5")
+        _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
+        fields_puts = [p for p in task_puts if "fields" in p]
+        assert len(fields_puts) == 1, task_puts
+        assert fields_puts[0] == {
+            "fields": {"model": "claude-sonnet-5", "effort": None, "host": None, "assigned_by": "board"}
+        }
+
+    def test_changing_effort_writes_exactly_one_fields_put(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t7"]').click()
+        expect(
+            page.locator(".drawer-assignment [data-field='model'] option")
+        ).to_have_count(3)
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(effort_select).to_be_visible()
+        effort_select.select_option("high")
+        _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
+        fields_puts = [p for p in task_puts if "fields" in p]
+        assert len(fields_puts) == 1, task_puts
+        assert fields_puts[0] == {
+            "fields": {"model": None, "effort": "high", "host": None, "assigned_by": "board"}
+        }
+
+    def test_changing_host_writes_exactly_one_fields_put(self, page: Page, agents_base_url):
+        """The host field is a `<select>` of registry hosts, not
+        free text — pick "build-box-2" (one of `_HOST_CATALOG`'s synthetic
+        entries) from the dropdown rather than typing it."""
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t7"]').click()
+        expect(
+            page.locator(".drawer-assignment [data-field='model'] option")
+        ).to_have_count(3)
+        host_select = page.locator(".drawer-assignment [data-field='host']")
+        expect(host_select).to_be_visible()
+        expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+        host_select.select_option("build-box-2")
+        _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
+        fields_puts = [p for p in task_puts if "fields" in p]
+        assert len(fields_puts) == 1, task_puts
+        assert fields_puts[0] == {
+            "fields": {"model": None, "effort": None, "host": "build-box-2", "assigned_by": "board"}
+        }
+
+    def test_saved_model_reflected_on_reopen(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t7"]').click()
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        expect(model_select.locator("option")).to_have_count(3)
+        model_select.select_option("claude-sonnet-5")
+        _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before reload
+
+        # The stub mutates the fixture card synchronously before fulfilling
+        # the PUT (mirrors a real save), so a fresh page load's initial
+        # board fetch is guaranteed to see it — reloading avoids racing the
+        # client's own async fetchBoard()-after-save against a click-driven
+        # close+reopen.
+        page.reload()
+        page.wait_for_selector('[data-card-id="t1"]')
+        page.locator('[data-card-id="t7"]').click()
+        reopened_model = page.locator(".drawer-assignment [data-field='model']")
+        expect(reopened_model.locator("option")).to_have_count(3)
+        expect(reopened_model).to_have_value("claude-sonnet-5")
+
+    def test_board_assignee_change_to_another_engine_drops_a_model_that_engine_lists(self, page: Page, agents_base_url):
+        """The drawer's own Assignee select (`.drawer-assignee`) is the one
+        reachable way an operator changes a card's engine — it hides
+        assignment.js's own engine row and moves the card by calling
+        moveCard() then renderDrawer(fresh), a full remount of
+        renderAssignmentPickers. A model claude's own catalog lists must
+        not survive that remount onto codex: populateModelOptions() drops
+        it to "engine default" on the mount for the new engine, and a
+        following effort save's PUT carries model: null."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-sonnet-5", "effort": "medium"}
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t7"]').click()
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        expect(model_select.locator("option")).to_have_count(3)
+        expect(model_select).to_have_value("claude-sonnet-5")
+
+        page.locator(".drawer-assignee").select_option("codex")
+        expect(model_select).to_have_value("")
+        expect(model_select.locator("option[data-unknown='true']")).to_have_count(0)
+        expect(model_select.locator("option:checked")).to_have_text("engine default")
+
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(effort_select).to_be_visible()
+        effort_select.select_option("high")
+        _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
+        fields_puts = [p for p in task_puts if "fields" in p]
+        assert len(fields_puts) == 1, task_puts
+        assert fields_puts[0]["fields"]["model"] is None
+
+    def test_board_assignee_change_keeps_a_model_no_engine_lists(self, page: Page, agents_base_url):
+        """The positive companion to
+        test_board_assignee_change_to_another_engine_drops_a_model_that_engine_lists:
+        a model absent from EVERY engine's catalog survives the same
+        board-driven remount, still selected and flagged
+        `data-unknown="true"`, and a following effort save's PUT still
+        carries it."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-legacy-9", "effort": "medium"}
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t7"]').click()
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        expect(model_select.locator("option[data-unknown='true']")).to_have_count(1)
+        expect(model_select).to_have_value("claude-legacy-9")
+
+        page.locator(".drawer-assignee").select_option("codex")
+        expect(model_select.locator("option[data-unknown='true']")).to_have_count(1)
+        expect(model_select).to_have_value("claude-legacy-9")
+
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(effort_select).to_be_visible()
+        effort_select.select_option("high")
+        _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
+        fields_puts = [p for p in task_puts if "fields" in p]
+        assert len(fields_puts) == 1, task_puts
+        assert fields_puts[0]["fields"]["model"] == "claude-legacy-9"
+
+    def test_open_button_posts_and_shows_success_toast(self, page: Page, agents_base_url):
+        open_calls = []
+        _open_board(page, agents_base_url, open_calls=open_calls)
+        page.locator('[data-card-id="t7"]').click()
+        open_btn = page.get_by_role("button", name="Open")
+        expect(open_btn).to_be_visible()
+        open_btn.click()
+        expect(page.locator(".toast:not(.error)")).to_contain_text("Opened.", timeout=5000)
+        assert open_calls == ["t7"]
+
+    def test_open_button_409_shows_detail_in_toast(self, page: Page, agents_base_url):
+        open_calls = []
+        _open_board(
+            page, agents_base_url, open_calls=open_calls,
+            open_response={"status": 409, "detail": "card is not in Assigned state"},
+        )
+        page.locator('[data-card-id="t7"]').click()
+        page.get_by_role("button", name="Open").click()
+        expect(page.locator(".toast.error")).to_contain_text(
+            "card is not in Assigned state", timeout=5000,
+        )
+        assert open_calls == ["t7"]
+
+    def test_open_button_absent_for_non_claude_codex_assignee(self, page: Page, agents_base_url):
+        # t2 is Assigned but assignee "me" — Open is only for claude/codex.
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Ship the release")
+        expect(page.get_by_role("button", name="Open")).to_have_count(0)
+
+    def test_open_button_absent_when_not_in_assigned_lane(self, page: Page, agents_base_url):
+        # t3 carries the "codex" assignee tag but sits in Human queue, not
+        # Assigned — the Open action is scoped to the Assigned lane.
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t3"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Debug prod issue")
+        expect(page.get_by_role("button", name="Open")).to_have_count(0)
+
+    def test_scheduled_card_drawer_has_no_assignment_pickers(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="s1"]').click()
+        expect(page.locator('[data-field="schedule-type"]')).to_be_visible()
+        expect(page.locator(".drawer-assignment")).to_have_count(0)
+        expect(page.locator(".assignment-row")).to_have_count(0)
+        expect(page.get_by_role("button", name="Open")).to_have_count(0)
+
+    def test_drawer_rebuild_skipped_while_picker_save_in_flight_then_converges_once_it_settles(self, page: Page, agents_base_url):
+        """A board frame that would otherwise rebuild the open drawer
+        (updateOpenDrawer's own SSE-poll path) skips the remount while a
+        picker save is still in flight — remounting the model/effort/host
+        pickers from a card snapshot that predates the save would show the
+        pre-save value and let the next picker change resend it, silently
+        discarding the committed one. The skip never advances
+        `openCardSnapshot`, so it is self-healing: the next board refresh
+        re-diffs against the original, unadvanced snapshot and rebuilds for
+        real once the save settles. Holds the effort PUT open with
+        `_hold_task_field_puts` so the save is provably still outstanding
+        when the frame lands, then releases it to prove convergence rather
+        than asserting only the suppression."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_stream_frames: list[str] = []
+        task_puts: list = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state, task_puts=task_puts,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        notes = page.locator(".drawer-notes")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+
+        effort_select.select_option("high")  # select_option blurs afterward, so !focused holds
+        expect(effort_select).to_have_value("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+        assert held[0][2]["fields"]["effort"] == "high"
+
+        # A frame lands while that save is still in flight, changing the
+        # OPEN card's notes — a DRAWER_EDITABLE_FIELDS field, so it would
+        # otherwise make updateOpenDrawer rebuild the whole drawer and
+        # remount the pickers from `fields.effort` exactly as the server
+        # still has it: unset, the value the operator moved away from. A
+        # tag flip on t1 (a different, closed card) is the drawer-
+        # independent proof the frame was actually delivered.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["notes"] = "updated while the effort save was in flight"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
+
+        # The in-flight save's own choice still shows — not reverted to
+        # the stale pre-save value by the skipped frame — and the
+        # notes field, part of the same skipped rebuild, still shows its
+        # pre-frame value rather than a half-applied one.
+        expect(effort_select).to_have_value("high")
+        expect(notes).to_have_value("")
+        assert len(task_puts) == 1  # no resend of a reverted value
+
+        # Releasing the held save settles it. `onSaved`'s own
+        # `fetchBoard()` re-diffs against the ORIGINAL (never-advanced)
+        # snapshot, sees the notes change the skip left unapplied, and
+        # rebuilds for real — the drawer converges on the server's actual
+        # state instead of staying stuck at its pre-save contents.
+        release(0)
+        expect(notes).to_have_value("updated while the effort save was in flight", timeout=5000)
+        expect(effort_select).to_have_value("high")
+        assert len(task_puts) == 1  # convergence rebuilds the drawer, it does not resend a PUT
+
+    def test_drawer_rebuild_applies_normally_from_sse_frame_with_no_save_in_flight(self, page: Page, agents_base_url):
+        """Positive counterpart to the deferred-rebuild test above,
+        guarding against over-correction: with no picker save in flight, a
+        board frame that changes a watched field on the open card still
+        rebuilds the drawer normally, including remounting the pickers
+        with a genuinely fresh field value."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        notes = page.locator(".drawer-notes")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+        expect(effort_select).to_have_value("")
+
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["notes"] = "changed elsewhere, no save in flight"
+                card["fields"] = {"effort": "max"}
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(notes).to_have_value("changed elsewhere, no save in flight", timeout=5000)
+        expect(page.locator(".drawer-assignment [data-field='effort']")).to_have_value("max")
+
+    def test_assignee_change_does_not_clobber_an_in_flight_picker_save(self, page: Page, agents_base_url):
+        """AC3's other rebuild path: the drawer's own Assignee select
+        calls renderDrawer(fresh) once its own moveCard PUT succeeds — a
+        remount that must not re-seed the model/effort/host pickers from a
+        card snapshot that predates a picker save still in flight.
+        moveCard PUTs the lane endpoint, not /api/tasks/{id}, so it isn't
+        held by `_hold_task_field_puts` and completes normally; the
+        rebuild instead defers until the held picker save settles, then
+        re-fetches the board before rebuilding — at settlement `findCard`
+        would still return the pre-save card. Drives the Assignee select
+        via `focus()` + a dispatched `change` (not `select_option`, which
+        blurs) so it keeps focus exactly as a real mouse pick does — the
+        same condition that blocks `updateOpenDrawer`'s own poll path and
+        is why the explicit rebuild is needed at all."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-sonnet-5"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(model_select.locator("option")).to_have_count(3)
+        expect(model_select).to_have_value("claude-sonnet-5")
+
+        effort_select.select_option("high")
+        expect(effort_select).to_have_value("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'local'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        assert lane_calls == [{"lane": "assigned", "assignee": "local"}]
+
+        # The Assignee select reflects the operator's direct choice
+        # regardless of any drawer remount.
+        expect(page.locator(".drawer-assignee")).to_have_value("local")
+        # The still-in-flight effort save's own choice survives — the
+        # remount this assignee change would otherwise trigger did not
+        # re-seed the effort picker from the stale, pre-save snapshot.
+        expect(effort_select).to_have_value("high")
+        assert len(task_puts) == 1  # no resend of a reverted value
+
+        # Releasing the held save settles it: the deferred rebuild fires,
+        # re-fetches the board, and remounts the pickers for the card's
+        # ACTUAL current engine ("local") — no model or host picker and no
+        # Open action, unlike the "claude" controls still on screen a
+        # moment ago. "claude-sonnet-5" belongs only to claude's catalog,
+        # so the remount drops it rather than carrying it onto "local".
+        release(0)
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_be_hidden(timeout=5000)
+        expect(page.locator(".drawer-assignment [data-row='host']")).to_be_hidden()
+        expect(page.locator(".drawer-assignment [data-row='effort']")).to_be_visible()
+        expect(page.get_by_role("button", name="Open")).to_have_count(0)
+        expect(page.locator(".drawer-assignment [data-field='model']")).to_have_value("")
+
+        # The next picker save carries the dropped model as null, not the
+        # stale claude value — the direct proof that the old engine's
+        # model never rides onto the new engine's next save.
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        effort_select.select_option("max")
+        _wait_for(lambda: len(task_puts) == 2, page=page)
+        assert task_puts[1] == {
+            "fields": {"model": None, "effort": "max", "host": None, "assigned_by": "board"}
+        }
+
+    def test_rejected_assignee_change_during_in_flight_picker_save_snaps_select_back(self, page: Page, agents_base_url):
+        """D1: a rejected Assignee change during an in-flight picker save
+        must not leave the rejected choice on screen for the life of the
+        drawer. Nothing was persisted, so the failure branch snaps the
+        select back to the card's actual assignee directly rather than
+        rebuilding the whole drawer — a rebuild while the picker save is
+        still outstanding would re-seed the model/effort/host pickers from
+        the pre-save snapshot, which is exactly the hazard the in-flight
+        guard exists to avoid."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(
+            page, agents_base_url, board_state=board_state, task_puts=task_puts,
+            lane_calls=lane_calls, lane_status_code=[409],
+        )
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        assignee_select = page.locator(".drawer-assignee")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+        expect(assignee_select).to_have_value("claude")
+
+        effort_select.select_option("high")
+        expect(effort_select).to_have_value("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        assignee_select.select_option("codex")
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
+
+        # The lane move was rejected and nothing was persisted — the
+        # select reads the card's actual, unchanged assignee, not the
+        # rejected pick, and exactly one toast reports the failure.
+        expect(assignee_select).to_have_value("claude")
+        expect(page.locator(".toast.error")).to_have_count(1)
+        # The still-in-flight effort save's own choice survives — no
+        # rebuild happened on the failure path to disturb it.
+        expect(effort_select).to_have_value("high")
+
+        release(0)
+        expect(assignee_select).to_have_value("claude")
+        expect(effort_select).to_have_value("high")
+        fields_puts = [p for p in task_puts if "fields" in p]
+        assert len(fields_puts) == 1  # no resend triggered by the failed assignee change
+
+    def test_assignee_change_waits_for_a_picker_save_queued_after_it_before_rebuilding(self, page: Page, agents_base_url):
+        """A picker save that starts AFTER the assignee change's deferral is
+        armed must still be waited for, not just the one already in flight
+        when the deferral armed. Hold the effort save, change the assignee
+        (arming the deferral against that outstanding save), then change
+        host while effort is still held — host's own save queues behind
+        it and its PUT reaches the network only once effort settles.
+        Releasing effort alone must not let the deferred rebuild paint the
+        pre-host snapshot over the committed host value; it must keep
+        waiting until host's save settles too, then reflect it — and a
+        following save must carry the committed host forward rather than
+        resending the stale one."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"host": "desktop-box"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        host_select = page.locator(".drawer-assignment [data-field='host']")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+        expect(host_select).to_have_value("desktop-box")
+
+        effort_select.select_option("max")
+        _wait_for(lambda: len(held) == 1, page=page)
+        assert held[0][2]["fields"]["effort"] == "max"
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        # Queued behind the still-held effort save — its own PUT hasn't
+        # reached the network yet.
+        host_select.select_option("build-box-2")
+        expect(host_select).to_have_value("build-box-2")
+        page.wait_for_timeout(150)
+        assert len(held) == 1, held  # host's save is still queued, not sent
+
+        release(0)  # effort settles
+        _wait_for(lambda: len(held) == 2, page=page)
+        assert held[1][2]["fields"]["host"] == "build-box-2"
+        release(1)  # host settles
+
+        # The committed host survives — the deferred rebuild waited for
+        # both saves, not just the first, before re-seeding the pickers.
+        expect(host_select).to_have_value("build-box-2", timeout=5000)
+        expect(effort_select).to_have_value("max")
+
+        # A following save carries the committed host forward, not the
+        # pre-save snapshot's value.
+        effort_select.select_option("high")
+        _wait_for(lambda: len(task_puts) == 3, page=page)
+        assert task_puts[2]["fields"]["host"] == "build-box-2"
+
+    def test_deferred_rebuild_fires_with_the_assignee_select_still_focused(self, page: Page, agents_base_url):
+        """Positive companion to the focus-guard tests below: a native
+        <select> keeps focus after firing its own change event, exactly
+        like the assignee select does once this handler's own moveCard
+        call resolves. The focus guard must not treat a focused select as an
+        active edit blocking the rebuild — a select holds no uncommitted
+        content a rebuild can destroy, and blocking on it would leave the
+        model/effort/host rows this deferral exists to update stuck on
+        the old assignee's chrome."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+
+        effort_select.select_option("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'local'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        expect(page.locator(".drawer-assignee")).to_be_focused()
+
+        release(0)
+
+        # The rebuild fires despite the select still holding focus — model
+        # and host rows hide and Open disappears for "local", the round-1
+        # convergence this deferral exists to preserve.
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_be_hidden(timeout=5000)
+        expect(page.locator(".drawer-assignment [data-row='host']")).to_be_hidden()
+        expect(page.get_by_role("button", name="Open")).to_have_count(0)
+
+    def test_deferred_rebuild_fires_with_the_assignee_select_still_focused_for_a_rows_keeping_engine(
+        self, page: Page, agents_base_url,
+    ):
+        """Companion to the test above for an engine whose picker rows stay
+        visible on assignment — codex keeps model/effort/host visible
+        (unlike local, which hides model and host), so this proves the
+        paint remounts the picker CONTENTS (a fresh catalog, a dropped
+        foreign model), not just row visibility, while the assignee select
+        still holds focus."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-opus-5", "effort": "medium"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        expect(model_select.locator("option")).to_have_count(3)
+
+        effort_select.select_option("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        expect(page.locator(".drawer-assignee")).to_be_focused()
+
+        release(0)
+
+        # Rows stay visible for codex, but the catalog remounts under the
+        # focused select — claude-opus-5 belongs only to claude's catalog.
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_be_visible(timeout=5000)
+        expect(page.locator(".drawer-assignment [data-row='host']")).to_be_visible()
+        expect(model_select.locator("option")).to_have_count(2)
+        expect(model_select).to_have_value("")
+        expect(page.get_by_role("button", name="Open")).to_have_count(1)
+
+    def test_deferred_rebuild_preserves_a_focused_text_edits_value_focus_and_caret_across_its_single_paint(
+        self, page: Page, agents_base_url,
+    ):
+        """The deferred rebuild paints exactly once, as soon as the
+        in-flight picker save settles — it never waits for a text control
+        to lose focus first. A focused textarea holds uncommitted
+        keystrokes an innerHTML replacement would otherwise destroy, so
+        board.js captures the control's value and selection range
+        immediately before the repaint and restores them into the rebuilt
+        drawer's matching control afterward. The captured control's own
+        blur still fires during the replacement, so its normal save
+        handler runs and the typed text reaches the vault."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-opus-5", "effort": "medium", "host": "desktop-box"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        notes = page.locator(".drawer-notes")
+        expect(model_select.locator("option")).to_have_count(3)
+
+        effort_select.select_option("max")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        notes.click()
+        notes.type("ssh key rotated, retry after 18:00")
+        notes.evaluate("el => el.setSelectionRange(4, 7)")  # caret over "key"
+
+        release(0)  # the effort save settles -- the deferred rebuild paints now
+
+        # The rebuild's own repaint blurs the pre-existing notes control,
+        # which fires its own save with the typed text -- proof the text
+        # reaches the vault, not just that it survives on screen.
+        _wait_for(lambda: len(held) == 2, page=page)
+        notes_index = next(i for i, (_, _, body) in enumerate(held) if "notes" in body)
+        assert held[notes_index][2]["notes"] == "ssh key rotated, retry after 18:00"
+        for cards in board_state["lanes"].values():
+            for card in cards:
+                if card["id"] == "t7":
+                    card["notes"] = held[notes_index][2]["notes"]
+        release(notes_index)
+
+        # The rebuilt drawer's notes control carries the same text,
+        # selection range, and focus forward across the repaint.
+        expect(notes).to_have_value("ssh key rotated, retry after 18:00")
+        expect(notes).to_be_focused()
+        assert notes.evaluate("el => [el.selectionStart, el.selectionEnd]") == [4, 7]
+
+        # The picker rebuild converges in the SAME paint — claude-opus-5
+        # is foreign to codex's catalog.
+        expect(model_select.locator("option")).to_have_count(2)
+        expect(model_select).to_have_value("")
+
+    def test_deferred_rebuild_does_not_paint_the_previous_card_after_switching_cards(self, page: Page, agents_base_url):
+        """The deferred rebuild closes over the card it was armed for — it
+        must not paint that card into the drawer once the operator has
+        switched to another one while it was waiting."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+
+        effort_select.select_option("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        # Switch to a different card while the deferral is still pending.
+        # The drawer's own backdrop covers the board while it's open, so
+        # switching cards is close-then-open, exactly like an operator
+        # closing one card's drawer and opening another's.
+        page.locator("#board-drawer-backdrop").click(position={"x": 10, "y": 10})
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Ship the release")
+
+        release(0)
+        page.wait_for_timeout(300)  # the deferred rebuild settles and would land here if unguarded
+
+        # Still t2 — the deferred rebuild armed for t7 never painted over it.
+        expect(page.locator(".drawer-title")).to_have_value("Ship the release")
+        expect(page.locator(".drawer-assignee")).to_have_value("me")
+
+    def test_deferred_rebuild_does_not_repopulate_a_closed_drawer(self, page: Page, agents_base_url):
+        """The deferred rebuild must not reopen a drawer the operator has
+        since closed — it repopulates hidden markup for no one and
+        advances `openCardSnapshot` while nothing is open."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+
+        effort_select.select_option("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        page.locator('[data-action="drawer-close"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+        release(0)
+        page.wait_for_timeout(300)  # the deferred rebuild settles and would land here if unguarded
+
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+        expect(page.locator(".drawer-title")).to_have_count(0)
+
+    def test_keyboard_pick_right_after_tags_blur_reads_the_converged_engines_catalog(
+        self, page: Page, agents_base_url,
+    ):
+        """The deferred rebuild is not gated on focus leaving a text
+        control — it starts the instant the in-flight picker save settles,
+        so a keyboard pick that lands in the same turn as the focus move
+        still reads the converged engine. Hold the effort save, change the
+        assignee to codex, click into Tags with no typing, release the
+        held save, and once its own round trip clears, Tab from Tags to
+        the Model select and press the down arrow with no pause between
+        the two key presses. The resulting PUT must carry a model from
+        codex's own catalog, never claude's, and the select's option list
+        itself must be codex's, not a stale holdover."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-opus-5", "effort": "medium", "host": "desktop-box"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        tags = page.locator(".drawer-tags")
+        expect(model_select).to_have_value("claude-opus-5")
+
+        effort_select.select_option("max")
+        _wait_for(lambda: len(held) == 1, page=page)
+        assert held[0][2]["fields"]["effort"] == "max"
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        tags.click()  # no typing -- Tags is the last text field before the pickers in tab order
+        expect(tags).to_be_focused()
+
+        release(0)  # the effort save settles; the deferred rebuild fires now
+        # A held route's fulfillment is delivered to the page over a
+        # separate CDP round trip from the next call below -- this gives
+        # that delivery, and the settle chain it triggers, the same
+        # ordinary breathing room a real network response would have
+        # before the operator's own, independent next key press. The
+        # actual race under test -- Tab then the arrow key -- stays
+        # back-to-back with nothing in between.
+        page.wait_for_timeout(50)
+        page.keyboard.press("Tab")  # Tags -> Model
+        page.keyboard.press("ArrowDown")  # picks codex's one real model off whatever list is live -- no pause
+
+        # Tab's own blur also fires the Tags field's unconditional
+        # re-save, alongside whatever the arrow key produced -- pull out
+        # whichever held entry actually carries fields (Tags' body
+        # carries none) rather than assuming a fixed position. The
+        # deferred rebuild's own repaint cannot finish converging the
+        # option list while a picker save it doesn't yet know the outcome
+        # of sits held, so wait for either that repaint or a picker save
+        # to show up before inspecting either.
+        _wait_for(
+            lambda: page.locator(".drawer-assignment [data-field='model'] option").count() == 2
+            or any(i > 0 and "fields" in body for i, (_, _, body) in enumerate(held)),
+            page=page,
+        )
+        fields_entries = [(i, body) for i, (_, _, body) in enumerate(held) if i > 0 and "fields" in body]
+        for i, body in fields_entries:
+            assert body["fields"]["model"] == "gpt-5.5", held  # codex's model, never claude's
+            release(i)
+
+        # The option list itself is codex's — a test asserting only the
+        # PUT body could still pass against a stale claude list that
+        # happened to share an option value.
+        expect(model_select.locator("option")).to_have_count(2, timeout=5000)
+        expect(model_select.locator("option").nth(1)).to_have_text("GPT-5.5")
+        if fields_entries:
+            expect(model_select).to_have_value("gpt-5.5")
+
+    def test_open_button_and_pickers_converge_immediately_once_the_deferral_settles(
+        self, page: Page, agents_base_url,
+    ):
+        """`renderDrawerActions` (the Open button) repaints in the same
+        drawer rebuild the picker rows come from, and that rebuild no
+        longer waits for the operator to move focus onto a picker first —
+        it paints the instant the held save settles, with a text control
+        (notes) still focused throughout."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-opus-5", "effort": "medium", "host": "desktop-box"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        notes = page.locator(".drawer-notes")
+        expect(page.get_by_role("button", name="Open")).to_have_count(1)
+
+        effort_select.select_option("max")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'local'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        notes.click()  # a focused text control does not block the paint
+        release(0)  # the effort save settles -- the rebuild paints now
+
+        # "local" never shows Open -- converges without any further
+        # operator action on a picker.
+        expect(page.get_by_role("button", name="Open")).to_have_count(0, timeout=5000)
+
+
+class TestLaneFilterMultiSelect:
+    """AC 1 & 2: a checkbox per lane, hidden lanes removed from the grid
+    entirely (not just emptied) so the rest widen, Done unchecked by default,
+    the selection persisted to and restored from localStorage, and a
+    malformed/unknown-lane stored value tolerated without blanking the
+    board. Relies on Playwright's per-test browser context giving each test
+    a fresh (empty) localStorage — no explicit clearing needed."""
+
+    def _open_lane_dropdown(self, page: Page):
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options")).to_have_class(re.compile(r"\bshow\b"))
+
+    def test_default_selection_is_every_lane_but_done(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        boxes = page.locator("#board-lane-filter-options input[type='checkbox']")
+        expect(boxes).to_have_count(len(LANE_IDS))
+        for lane_id in LANE_IDS:
+            box = page.locator(f"#board-lane-filter-options input[value='{lane_id}']")
+            if lane_id == "done":
+                expect(box).not_to_be_checked()
+            else:
+                expect(box).to_be_checked()
+
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        for lane_id in DEFAULT_VISIBLE_LANE_IDS:
+            expect(page.locator(f'.board-lane[data-lane="{lane_id}"]')).to_be_visible()
+
+    def test_unchecking_a_lane_removes_column_and_widens_the_rest(self, page: Page, agents_base_url):
+        # Wide viewport so the visible lanes have room to grow rather than
+        # already sitting at their flex-basis/min-width overflowing the
+        # container (#board-lanes scrolls horizontally when they do).
+        page.set_viewport_size({"width": 2400, "height": 900})
+        _open_board(page, agents_base_url)
+        width_before = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
+
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+
+        width_after = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
+        assert width_after > width_before, (width_before, width_after)
+
+    def test_unchecking_a_lane_widens_the_rest_at_1280_viewport(self, page: Page, agents_base_url):
+        """At 1280x800 with the six default lanes, the column `min-width`
+        floor is 196px: a 240px floor would pin every column there and hiding
+        one would change nothing (240 -> 240) — the other widening test in
+        this class instead uses a much wider 2400px viewport where columns
+        have room to shrink. 196px (not 200px, which would still leave a
+        20px overflow — exactly the container's padding — forcing a
+        scrollbar even at six lanes) lets the six lanes actually fit 1280px
+        without horizontal scroll, so hiding one measurably widens the
+        rest."""
+        page.set_viewport_size({"width": 1280, "height": 800})
+        _open_board(page, agents_base_url)
+        # Pin the "fits without a scrollbar" half of the claim above, not
+        # just the widening-on-hide half.
+        scroll_width, client_width = page.locator("#board-lanes").evaluate(
+            "el => [el.scrollWidth, el.clientWidth]"
+        )
+        assert scroll_width <= client_width, (scroll_width, client_width)
+        width_before = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
+
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+
+        width_after = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
+        assert width_after > width_before, (width_before, width_after)
+
+    def test_rechecking_restores_canonical_dom_order(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='in_progress']").uncheck()
+        expect(page.locator('.board-lane[data-lane="in_progress"]')).to_have_count(0)
+
+        page.locator("#board-lane-filter-options input[value='in_progress']").check()
+        expect(page.locator('.board-lane[data-lane="in_progress"]')).to_be_visible()
+
+        lane_order = page.locator(".board-lane").evaluate_all("els => els.map(el => el.dataset.lane)")
+        assert lane_order == DEFAULT_VISIBLE_LANE_IDS, lane_order
+
+    def test_selection_survives_a_reload(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='human_queue']").uncheck()
+        expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
+
+        page.reload()
+        page.wait_for_selector('[data-card-id="t1"]')
+        expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).to_be_visible()
+
+    def test_unknown_stored_lane_id_is_tolerated(self, page: Page, agents_base_url):
+        """A stored id naming a lane that does not exist is filtered out —
+        whatever's still valid is kept, and the board is never blanked.
+        Includes "unassigned" (where fixture card t1 lives) so _open_board's
+        own t1-visibility wait — needed since it stubs routes before every
+        navigation — isn't racing a lane that was deliberately excluded."""
+        _seed_lane_storage(page, json.dumps(["unassigned", "assigned", "some-retired-lane"]))
+        _open_board(page, agents_base_url)
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_be_visible()
+        expect(page.locator(".board-lane")).to_have_count(2)
+
+    def test_malformed_stored_value_falls_back_to_default(self, page: Page, agents_base_url):
+        _seed_lane_storage(page, "not valid json")
+        _open_board(page, agents_base_url)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        for lane_id in DEFAULT_VISIBLE_LANE_IDS:
+            expect(page.locator(f'.board-lane[data-lane="{lane_id}"]')).to_be_visible()
+
+    def test_stored_empty_selection_is_restored_not_reset_to_default(self, page: Page, agents_base_url):
+        """A deliberately emptied selection ([]) is a valid, intentional state —
+        AC 2 says the selection is restored from storage, and the
+        empty-state hint already covers the UI for it — so a reload must
+        restore it as empty, not treat it as malformed and fall back to the
+        six default lanes. Can't use `_open_board`'s helper here since it
+        waits for a card that would never render with zero lanes shown."""
+        _seed_lane_storage(page, json.dumps([]))
+        _stub_routes(page, _board_fixture(), [], [], [200], [], [])
+        page.goto(f"{agents_base_url}/agents")
+        expect(page.locator(".board-lanes-empty-hint")).to_be_visible()
+        expect(page.locator(".board-lane")).to_have_count(0)
+
+    def test_storage_throwing_getitem_setitem_does_not_break_the_board(self, page: Page, agents_base_url):
+        """A blocked/private-browsing localStorage
+        whose getItem/setItem throw must not crash the board —
+        loadLaneSelection and saveLaneSelection catch around both."""
+        page.add_init_script(
+            """
+            Object.defineProperty(Storage.prototype, 'getItem', {
+              configurable: true,
+              value: function() { throw new Error('blocked'); },
+            });
+            Object.defineProperty(Storage.prototype, 'setItem', {
+              configurable: true,
+              value: function() { throw new Error('blocked'); },
+            });
+            """
+        )
+        _open_board(page, agents_base_url)
+        for lane_id in DEFAULT_VISIBLE_LANE_IDS:
+            expect(page.locator(f'.board-lane[data-lane="{lane_id}"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+
+        # A toggle that tries to persist (and fails) must still apply
+        # in-memory rather than throwing into an unhandled listener error.
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+
+    def test_clear_control_restores_default(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_be_visible()
+
+        page.locator("#board-lane-filter-clear").click()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        for lane_id in LANE_IDS:
+            box = page.locator(f"#board-lane-filter-options input[value='{lane_id}']")
+            if lane_id == "done":
+                expect(box).not_to_be_checked()
+            else:
+                expect(box).to_be_checked()
+
+    def test_unchecking_all_lanes_shows_empty_state_hint_not_a_blank_board(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        for lane_id in LANE_IDS:
+            page.locator(f"#board-lane-filter-options input[value='{lane_id}']").uncheck()
+        expect(page.locator(".board-lane")).to_have_count(0)
+        expect(page.locator(".board-lanes-empty-hint")).to_be_visible()
+
+
+class TestLaneAddButton:
+    """AC 3: a full-width '+' button per visible DIRECT lane opens the
+    composer with that lane preselected; Review and Scheduled get no
+    button (plan_lane_move rejects both — api/services/agent_board.py).
+    Creating from the Assigned lane's '+' carries the chosen assignee tag
+    through both the POST /api/tasks body and the follow-up PUT .../lane."""
+
+    def test_add_button_present_on_direct_lanes_and_absent_on_scheduled_and_review(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        for lane_id in ["unassigned", "assigned", "in_progress", "human_queue"]:
+            expect(page.locator(f'.board-lane[data-lane="{lane_id}"] .board-lane-add')).to_be_visible()
+        # Guard the absence assertion the same way the Review half below
+        # does — asserting `.to_have_count(0)` alone passes vacuously if the
+        # Scheduled column itself is not rendering at all.
+        expect(page.locator('.board-lane[data-lane="scheduled"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="scheduled"] .board-lane-add')).to_have_count(0)
+
+        # Review is empty in the fixture and hidden by default — check it so
+        # its absent "+" is actually observable.
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='review']").check()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="review"] .board-lane-add')).to_have_count(0)
+
+    def test_unassigned_lane_add_button_opens_composer_with_lane_preselected(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('.board-lane[data-lane="unassigned"] .board-lane-add').click()
+        expect(page.locator("#new-card-title")).to_be_visible()
+        expect(page.locator("#new-card-lane")).to_have_value("unassigned")
+
+    def test_assigned_lane_add_button_creates_with_assignee_tag_and_moves_to_assigned(self, page: Page, agents_base_url):
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator('.board-lane[data-lane="assigned"] .board-lane-add').click()
+        expect(page.locator("#new-card-lane")).to_have_value("assigned")
+        page.locator("#new-card-desc").fill("Triage the new alert")
+        page.locator("#new-card-assignee").select_option("codex")
+        page.locator("#new-card-create").click()
+
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Triage the new alert", "tags": ["codex"]}, task_posts
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        assert lane_calls[0] == {"lane": "assigned", "assignee": "codex"}, lane_calls
+
+        # Composer closes and the new card lands in the Assigned column.
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_contain_text("Triage the new alert")
+
+    def test_assigned_lane_requires_an_assignee(self, page: Page, agents_base_url):
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator('.board-lane[data-lane="assigned"] .board-lane-add').click()
+        page.locator("#new-card-desc").fill("No assignee yet")
+        page.locator("#new-card-create").click()
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert task_posts == [], task_posts
+        # Composer stays open — nothing was created.
+        expect(page.locator("#new-card-title")).to_be_visible()
+
+    def test_top_bar_new_card_button_defaults_to_unassigned_and_issues_no_lane_put(self, page: Page, agents_base_url):
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-new-card").click()
+        expect(page.locator("#new-card-lane")).to_have_value("unassigned")
+        page.locator("#new-card-desc").fill("Plain new card")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Plain new card"}, task_posts
+        assert lane_calls == [], lane_calls  # unassigned never triggers a lane PUT
+
+    def test_choosing_an_assignee_while_lane_is_unassigned_flips_lane_to_assigned(self, page: Page, agents_base_url):
+        """The common flow (top-bar New card, title, assignee codex, Create)
+        must not leave the Lane select reading Unassigned while the
+        assignee tag on the POST body silently files the card in Assigned
+        anyway (derive_lane files any assignee-tagged task there) — that
+        would contradict the outcome with no toast. The select flips to
+        Assigned as soon as an assignee is chosen, so what's displayed
+        matches where the card actually goes and any resulting lane PUT
+        agrees with the chosen assignee."""
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-new-card").click()
+        expect(page.locator("#new-card-lane")).to_have_value("unassigned")
+        page.locator("#new-card-assignee").select_option("codex")
+        expect(page.locator("#new-card-lane")).to_have_value("assigned")
+        page.locator("#new-card-desc").fill("Silent lane flip check")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0]["tags"] == ["codex"], task_posts
+        # No lane PUT contradicts the assignee that was actually chosen.
+        assert all(c.get("assignee") == "codex" for c in lane_calls), lane_calls
+
+    def test_assignee_then_manual_unassigned_override_still_lands_in_assigned(self, page: Page, agents_base_url):
+        """The auto-flip above only fires on the assignee
+        select's own `change` event — if the operator picks an assignee
+        (Lane auto-flips to Assigned) and then edits Lane back to Unassigned
+        by hand, the raw Lane value lies about where the card will land:
+        derive_lane (api/services/agent_board.py) files any assignee-tagged
+        task under Assigned regardless of what Lane says. Recomputing
+        `effectiveLane` at submit makes the actual lane PUT — and the card's
+        resting lane — match the tag, not the overridden select."""
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-assignee").select_option("me")
+        expect(page.locator("#new-card-lane")).to_have_value("assigned")
+        page.locator("#new-card-lane").select_option("unassigned")
+        page.locator("#new-card-desc").fill("Manually reset to Unassigned")
+        page.locator("#new-card-create").click()
+
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0]["tags"] == ["me"], task_posts
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        assert lane_calls[0]["lane"] == "assigned", lane_calls
+
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_contain_text("Manually reset to Unassigned")
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).not_to_contain_text("Manually reset to Unassigned")
+
+    def test_assignee_then_manual_unassigned_override_reveals_hidden_assigned_lane(self, page: Page, agents_base_url):
+        """Same scenario as above with Assigned hidden by the filter first —
+        the reveal-on-create must use the lane the card
+        actually reached (Assigned), not the lane the composer's Lane select
+        was left reading (Unassigned) after the manual override."""
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='assigned']").uncheck()
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_have_count(0)
+
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-assignee").select_option("me")
+        page.locator("#new-card-lane").select_option("unassigned")
+        page.locator("#new-card-desc").fill("Hidden Assigned reveal")
+        page.locator("#new-card-create").click()
+
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_contain_text("Hidden Assigned reveal")
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options input[value='assigned']")).to_be_checked()
+
+    def test_clearing_assignee_restores_lane_select_to_unassigned(self, page: Page, agents_base_url):
+        """The reverse of the assignee-driven flip above. Picking an
+        assignee flips Lane to Assigned; clearing the assignee back to blank
+        must flip it back — otherwise Create fails on "Pick an assignee for
+        the Assigned lane." against a select the operator never touched
+        (a one-directional dead end)."""
+        _open_board(page, agents_base_url)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-assignee").select_option("me")
+        expect(page.locator("#new-card-lane")).to_have_value("assigned")
+        page.locator("#new-card-assignee").select_option("")
+        expect(page.locator("#new-card-lane")).to_have_value("unassigned")
+
+    def test_in_progress_lane_with_agent_assignee_is_rejected_before_creating(self, page: Page, agents_base_url):
+        """plan_lane_move 409s a lane=in_progress move
+        for any AGENT_ASSIGNEES tag ("only the worker claims agent-assigned
+        tasks"), reachable in three clicks from the In-progress lane's own
+        '+'. The composer must reject this client-side before any POST —
+        creating the card and letting the move 409 afterward would swallow
+        the rejection and leave a stray card sitting in Assigned. Mirrors
+        test_assigned_lane_requires_an_assignee's shape."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator('.board-lane[data-lane="in_progress"] .board-lane-add').click()
+        expect(page.locator("#new-card-lane")).to_have_value("in_progress")
+        page.locator("#new-card-desc").fill("Should not be created")
+        page.locator("#new-card-assignee").select_option("codex")
+        page.locator("#new-card-create").click()
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert task_posts == [], task_posts
+        expect(page.locator("#new-card-title")).to_be_visible()
+
+    def test_create_into_a_hidden_lane_reveals_it_with_the_new_card(self, page: Page, agents_base_url):
+        """The composer's Lane select offers every direct
+        lane regardless of what the filter shows — creating into Done (hidden
+        by default) would otherwise land the card nowhere visible with zero
+        toasts. A successful create reveals the target lane in the filter."""
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-lane").select_option("done")
+        page.locator("#new-card-desc").fill("Filed straight to Done")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="done"]')).to_contain_text("Filed straight to Done")
+        # The checkbox reflects the reveal too — the selection is persisted,
+        # not a one-off render fluke.
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options input[value='done']")).to_be_checked()
+
+    def test_non_json_create_response_does_not_throw_or_leave_composer_open(self, page: Page, agents_base_url):
+        """`await r.json()` on the create response would throw
+        on a 200 with a non-JSON body. Unguarded, that leaves
+        the operator seeing a
+        "Failed to execute 'json'..." toast with the composer staying open
+        and Create re-enabled even though the task WAS created, inviting a
+        duplicate on a second click."""
+        task_posts = []
+
+        def bad_json_handler(route):
+            body = json.loads(route.request.post_data or "{}")
+            task_posts.append(body)
+            route.fulfill(status=200, content_type="text/plain", body="not json")
+
+        _open_board(page, agents_base_url)
+        page.route(re.compile(r"/api/tasks$"), bad_json_handler)
+
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Should not duplicate")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert len(task_posts) == 1, task_posts
+
+    def test_non_json_create_response_into_non_unassigned_lane_shows_toast(self, page: Page, agents_base_url):
+        """Guarding against the non-JSON-response throw above must not turn
+        into a silent wrong outcome whenever a non-Unassigned lane is
+        requested — the test above only exercises the Unassigned target,
+        where staying put is correct and silence is fine. A non-JSON 200
+        into e.g. Human queue must surface a toast: the
+        card WAS created, just not confirmed to have moved where asked, with
+        no id available to move it there."""
+        task_posts = []
+        lane_calls = []
+
+        def bad_json_handler(route):
+            body = json.loads(route.request.post_data or "{}")
+            task_posts.append(body)
+            route.fulfill(status=200, content_type="text/plain", body="not json")
+
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.route(re.compile(r"/api/tasks$"), bad_json_handler)
+
+        page.locator('.board-lane[data-lane="human_queue"] .board-lane-add').click()
+        page.locator("#new-card-desc").fill("Should toast, not vanish silently")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        assert lane_calls == [], lane_calls  # no id to move with — no PUT was attempted
+
+    def test_create_with_failing_lane_put_toasts_closes_and_leaves_card_unassigned(self, page: Page, agents_base_url):
+        """POST /api/tasks succeeding but the follow-up
+        lane PUT 500ing must not be silently swallowed — an error toast
+        shows, the composer still closes (the card WAS created), and the
+        card is visible in Unassigned. `moveCard`'s own failure path never
+        re-fetches, so the board is refreshed here instead. Deliberately
+        does NOT reuse TestNoConsoleErrorsMainFlow's
+        zero-console-errors pattern — Chromium logs a console.error for the
+        500 response itself."""
+        task_posts = []
+        lane_calls = []
+        _open_board(
+            page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls, lane_status_code=[500],
+        )
+        page.locator('.board-lane[data-lane="in_progress"] .board-lane-add').click()
+        page.locator("#new-card-desc").fill("Half-created card")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).to_contain_text("Half-created card")
+
+    def test_failed_move_into_hidden_lane_does_not_reveal_or_persist_it(self, page: Page, agents_base_url):
+        """`ensureLaneVisible` must not run on the
+        lane-PUT-failure path — running it there would reveal (and persist
+        to localStorage) a lane the card never actually reached. A failed
+        create-into-a-hidden-lane must leave the operator's saved filter
+        selection exactly as they left it — Done stays hidden and unchecked,
+        and the card is visible where it actually landed (Unassigned)."""
+        task_posts = []
+        lane_calls = []
+        _open_board(
+            page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls, lane_status_code=[500],
+        )
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-lane").select_option("done")
+        page.locator("#new-card-desc").fill("Should stay hidden")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).to_contain_text("Should stay hidden")
+        stored = page.evaluate("localStorage.getItem('lifeos.agents.board.lanes')")
+        assert stored is None, stored
+
+    def test_failed_move_with_an_assignee_reveals_the_hidden_assigned_lane_not_the_requested_one(
+        self, page: Page, agents_base_url
+    ):
+        """`landedLane` is always the lane the card
+        actually reached — on a failed move that's the tag-derived resting
+        lane (assignee present -> Assigned), never the lane requested. A
+        card created with an assignee into Human queue, whose move PUT then
+        500s, really lands in Assigned — so Assigned must be revealed and
+        show the card, exactly as a successful create into a hidden lane
+        would. Human queue, the *requested* lane the
+        move never reached, must stay hidden and unchecked, and must never
+        appear in the persisted selection. Hide both Assigned and Human
+        queue, create into Human queue with an agent assignee, and let the
+        lane PUT 500."""
+        task_posts = []
+        lane_calls = []
+        _open_board(
+            page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls, lane_status_code=[500],
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='assigned']").uncheck()
+        page.locator("#board-lane-filter-options input[value='human_queue']").uncheck()
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
+        # The lane selection persists under the shared filters key,
+        # not the board-only key those two lanes' `_seed_lane_storage` peers
+        # elsewhere in this file target.
+        stored_before = page.evaluate("localStorage.getItem('lifeos.agents.filters.v1')")
+
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Should reveal Assigned, not Human queue")
+        page.locator("#new-card-assignee").select_option("codex")
+        page.locator("#new-card-lane").select_option("human_queue")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_contain_text(
+            "Should reveal Assigned, not Human queue"
+        )
+        expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
+        stored_after = page.evaluate("localStorage.getItem('lifeos.agents.filters.v1')")
+        assert stored_after != stored_before, (stored_before, stored_after)
+        after_lanes = json.loads(stored_after)["lanes"]
+        assert "assigned" in after_lanes
+        assert "human_queue" not in after_lanes
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options input[value='assigned']")).to_be_checked()
+        expect(page.locator("#board-lane-filter-options input[value='human_queue']")).not_to_be_checked()
+
+
+class TestDrawerClickOutsideClose:
+    """AC 4: a click on the backdrop (board background/lane/card) closes
+    the drawer; a click inside it does not; a mousedown-inside ->
+    mouseup-outside sequence (the scrollbar-drag case) must NOT close it;
+    Escape still closes it, but not when a modal is on top of the drawer."""
+
+    def test_click_on_backdrop_closes_drawer(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_be_visible()
+        # A point clearly outside the drawer panel, which sits at the right
+        # edge (`.board-drawer-backdrop { justify-content: flex-end }`).
+        page.locator("#board-drawer-backdrop").click(position={"x": 10, "y": 10})
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+    def test_click_inside_drawer_does_not_close(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_be_visible()
+        page.locator(".drawer-label").first.click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        expect(page.locator(".drawer-title")).to_have_value("Ship the release")
+
+    def test_mousedown_inside_mouseup_outside_does_not_close(self, page: Page, agents_base_url):
+        """The scrollbar-drag guard: a mousedown starting inside the drawer
+        whose mouseup lands on the backdrop still fires a `click` event on
+        the backdrop — must not be treated as an outside click."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        drawer_box = page.locator(".board-drawer").bounding_box()
+        backdrop_box = page.locator("#board-drawer-backdrop").bounding_box()
+
+        page.mouse.move(drawer_box["x"] + drawer_box["width"] / 2, drawer_box["y"] + 50)
+        page.mouse.down()
+        page.mouse.move(backdrop_box["x"] + 10, backdrop_box["y"] + 10, steps=5)
+        page.mouse.up()
+
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
+    def test_mousedown_outside_mouseup_inside_does_not_close(self, page: Page, agents_base_url):
+        """A mousedown starting on the backdrop whose mouseup lands INSIDE the
+        drawer (e.g. a text selection started just left of the notes field
+        and dragged rightward across it) still fires a `click` on the
+        backdrop — the nearest common ancestor of the two targets. Tracking
+        only the mousedown target would close the
+        drawer mid-selection."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        drawer_box = page.locator(".board-drawer").bounding_box()
+        backdrop_box = page.locator("#board-drawer-backdrop").bounding_box()
+
+        page.mouse.move(backdrop_box["x"] + 10, backdrop_box["y"] + 10)
+        page.mouse.down()
+        page.mouse.move(drawer_box["x"] + drawer_box["width"] / 2, drawer_box["y"] + 50, steps=5)
+        page.mouse.up()
+
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
+    def test_escape_closes_the_drawer(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_be_visible()
+        page.keyboard.press("Escape")
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+    def test_escape_does_not_close_drawer_when_a_modal_is_on_top(self, page: Page, agents_base_url):
+        """A composer/answer modal renders above the drawer
+        (`.modal-backdrop` z-index 100 > `.board-drawer-backdrop`'s 90) —
+        Escape must not fall through and close the drawer underneath it."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t3"]').click()  # t3 has a pending_question -> Answer button
+        page.get_by_role("button", name="Answer").click()
+        expect(page.locator("#answer-title")).to_be_visible()
+
+        page.keyboard.press("Escape")
+
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        expect(page.locator("#answer-title")).to_be_visible()
+
+
+class TestNotesAutosize:
+    """AC 5: the notes textarea's height tracks its content on input
+    and on open, capped at 2/3 of the viewport height, after which it
+    scrolls internally (scrollHeight keeps growing past offsetHeight)."""
+
+    def test_grows_on_open_with_existing_content(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        long_notes = "\n".join(f"note line {i}" for i in range(30))
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t2":
+                card["notes"] = long_notes
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        expect(notes).to_be_visible()
+        expect(notes).to_have_value(long_notes)
+        offset_height = notes.evaluate("el => el.offsetHeight")
+        # CSS min-height is 5rem (~80px); 30 lines must have grown well past
+        # that on open, before any input event ever fires.
+        assert offset_height > 100, offset_height
+
+    def test_grows_on_input_and_caps_at_two_thirds_viewport_height(self, page: Page, agents_base_url):
+        page.set_viewport_size({"width": 1200, "height": 600})
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        expect(notes).to_be_visible()
+
+        offset_height_empty = notes.evaluate("el => el.offsetHeight")
+        many_lines = "\n".join(f"note line {i}" for i in range(200))
+        notes.fill(many_lines)
+
+        max_height = 600 * 2 / 3
+        offset_height = notes.evaluate("el => el.offsetHeight")
+        scroll_height = notes.evaluate("el => el.scrollHeight")
+        assert offset_height > offset_height_empty, (offset_height_empty, offset_height)
+        assert offset_height <= max_height + 1, (offset_height, max_height)  # +1 for rounding
+        # Tight enough on the lower bound to actually pin "two thirds" rather
+        # than just "some cap well below the tolerance" — a CSS/JS mismatch
+        # (CSS says 66vh, JS says 2/3 = 66.667vh, and CSS
+        # always wins) would land here at 396px, a full 4px under this floor
+        # at a 600px viewport.
+        assert offset_height > max_height - 1, (offset_height, max_height)
+        assert scroll_height > offset_height, (scroll_height, offset_height)  # capped — scrolls internally
+
+    def test_not_prematurely_scrollable_below_the_cap(self, page: Page, agents_base_url):
+        """`* { box-sizing: border-box }` (web/agents.html)
+        means the assigned height must also absorb the 1px top/bottom
+        borders, or the box is clipped 2px short at every content length
+        below the cap and scrolls internally the whole time instead of only
+        once capped (AC 5)."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        expect(notes).to_be_visible()
+        mid_lines = "\n".join(f"note line {i}" for i in range(10))
+        notes.fill(mid_lines)
+        scroll_height = notes.evaluate("el => el.scrollHeight")
+        client_height = notes.evaluate("el => el.clientHeight")
+        assert scroll_height <= client_height, (scroll_height, client_height)
+
+    def test_cap_re_applies_on_viewport_shrink_without_a_resize_listener(self, page: Page, agents_base_url):
+        """Recomputing the cap from
+        window.innerHeight only on `input`/drawer-render would let shrinking
+        the window leave a box grown past the NEW, smaller cap. CSS
+        `max-height: 66vh` on `.drawer-notes-autosize` (NOT a resize
+        listener) reapplies automatically — this test resizes and
+        asserts the cap held with no further `input` event ever firing."""
+        page.set_viewport_size({"width": 1200, "height": 900})
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        many_lines = "\n".join(f"note line {i}" for i in range(200))
+        notes.fill(many_lines)
+
+        page.set_viewport_size({"width": 1200, "height": 400})
+        offset_height = notes.evaluate("el => el.offsetHeight")
+        assert offset_height <= 400 * 0.67, offset_height  # 66vh + a little rounding slack
+
+
+class TestNoConsoleErrorsMainFlow:
+    """Exercises the board's lane filter, per-lane add,
+    drawer click-outside-close, notes autosize — and asserts the page never
+    logs a console error or throws an uncaught exception along the way."""
+
+    def test_main_flow_produces_no_console_errors(self, page: Page, agents_base_url):
+        errors = []
+        page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
+        page.on("pageerror", lambda exc: errors.append(str(exc)))
+
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+        page.locator("#board-lane-filter-options input[value='review']").check()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_be_visible()
+        # Close the dropdown before interacting with the board underneath it
+        # — the narrower lane `min-width` shifts the Assigned
+        # lane's "+" button further left, under the still-open dropdown's
+        # footprint, so leaving the dropdown open would reliably block the
+        # click below.
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options")).not_to_have_class(re.compile(r"\bshow\b"))
+
+        page.locator('.board-lane[data-lane="assigned"] .board-lane-add').click()
+        page.locator("#new-card-desc").fill("Follow up with the vendor")
+        page.locator("#new-card-assignee").select_option("me")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1 and len(lane_calls) == 1, page=page)
+
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        expect(notes).to_be_visible()
+        notes.fill("a longer note\nwith several\nlines of text")
+        page.locator("#board-drawer-backdrop").click(position={"x": 10, "y": 10})
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+        assert errors == [], errors
+
+
+# ---------------------------------------------------------------------------
+# Human-move restrictions on agent-owned cards, and Cancel. `policy` blocks
+# below mirror exactly what `_card_policy` (api/routes/agents.py) computes
+# from `agent_board.evaluate_card_action` — the board/drawer never
+# re-derive these rules, they just read `card.policy`.
+# ---------------------------------------------------------------------------
+
+_WORKER_OWNED_REASON = (
+    "the worker owns this task while it is running or waiting on an "
+    "answer — answer or kill the session first"
+)
+_AGENT_OWNED_MANAGED_REASON = (
+    "agent-owned cards are managed by the agent — reassign, unassign, or "
+    "cancel this card instead"
+)
+_ONLY_WORKER_CLAIMS_REASON = "only the worker claims agent-assigned tasks"
+
+
+def _allowed(v=True, reason=None):
+    return {"allowed": v, "reason": reason}
+
+
+def _unclaimed_agent_owned_card(card_id="t8", lane="assigned", title="Deploy the staging build"):
+    """An unclaimed `#codex`-assigned card: reassign/unassign/cancel are
+    allowed, In progress/Human queue/Done are refused."""
+    return {
+        "kind": "task", "id": card_id, "title": title,
+        "notes": "", "status": "todo", "tags": ["codex"], "assignee": "codex",
+        "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+        "session": None, "pending_question": None,
+        "policy": {
+            "claimed": False, "agent_owned": True,
+            "cancel": _allowed(True),
+            "assignee": _allowed(True),
+            "fields": _allowed(True),
+            # `lanes` lists ONLY refused lanes — Unassigned and Assigned
+            # are allowed here, so they're simply absent, not
+            # present-and-true. The client already treats an absent entry
+            # as allowed (onCardDropped/renderDrawerActions).
+            "lanes": {
+                "in_progress": _allowed(False, _ONLY_WORKER_CLAIMS_REASON),
+                "human_queue": _allowed(False, _AGENT_OWNED_MANAGED_REASON),
+                "review": _allowed(False, "lane 'review' cannot be set directly"),
+                "scheduled": _allowed(False, "lane 'scheduled' cannot be set directly"),
+                "done": _allowed(False, _AGENT_OWNED_MANAGED_REASON),
+            },
+        },
+    }
+
+
+def _claimed_agent_owned_card(card_id="t9", lane="in_progress", title="Migrate the database"):
+    """A claimed (`agent-running`) `#codex` card: every lane, the assignee
+    picker, and the field pickers are refused; only Cancel is left."""
+    return {
+        "kind": "task", "id": card_id, "title": title,
+        "notes": "", "status": "in_progress", "tags": ["codex", "agent-running"], "assignee": "codex",
+        "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+        "session": None, "pending_question": None,
+        "policy": {
+            "claimed": True, "agent_owned": True,
+            "cancel": _allowed(True),
+            "assignee": _allowed(False, _WORKER_OWNED_REASON),
+            "fields": _allowed(False, _WORKER_OWNED_REASON),
+            "lanes": {lane_id: _allowed(False, _WORKER_OWNED_REASON if lane_id not in ("review", "scheduled") else f"lane '{lane_id}' cannot be set directly")
+                      for lane_id in ("unassigned", "assigned", "in_progress", "human_queue", "review", "scheduled", "done")},
+        },
+    }
+
+
+def _claimed_no_assignee_card(card_id="t12", title="Triage the queue"):
+    """A claimed card with no engine-specific assignee."""
+    return {
+        "kind": "task", "id": card_id, "title": title,
+        "notes": "", "status": "in_progress", "tags": ["agent-running"], "assignee": None,
+        "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+        "session": None, "pending_question": None,
+        "policy": {
+            "claimed": True, "agent_owned": True,
+            "cancel": _allowed(True),
+            "assignee": _allowed(False, _WORKER_OWNED_REASON),
+            "fields": _allowed(False, _WORKER_OWNED_REASON),
+            "lanes": {lane_id: _allowed(False, _WORKER_OWNED_REASON if lane_id not in ("review", "scheduled") else f"lane '{lane_id}' cannot be set directly")
+                      for lane_id in ("unassigned", "assigned", "in_progress", "human_queue", "review", "scheduled", "done")},
+        },
+    }
+
+
+class TestAgentCardMoveRulesAndCancel:
+    def test_refused_drag_shows_toast_and_issues_no_lane_put(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        lane_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, lane_calls=lane_calls)
+
+        _drag_card(page, "t8", "human_queue")
+        expect(page.locator(".toast.error")).to_contain_text(_AGENT_OWNED_MANAGED_REASON, timeout=5000)
+        # The client-side policy check refused the move before any PUT —
+        # the server is still the authority for a stale board, but a fresh
+        # one never even makes the round trip.
+        assert lane_calls == []
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t8"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t8"]')).to_have_count(0)
+
+    def test_claimed_card_drawer_disables_assignee_and_field_pickers_with_visible_reason(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append(_claimed_agent_owned_card())
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        page.locator('[data-card-id="t9"]').click()
+        assignee = page.locator(".drawer-assignee")
+        expect(assignee).to_be_disabled()
+        expect(page.locator('[data-field="assignee-reason"]')).to_contain_text(_WORKER_OWNED_REASON)
+
+        effort = page.locator(".assignment-effort")
+        expect(effort).to_be_visible()
+        expect(effort).to_be_disabled()
+        host = page.locator(".assignment-host")
+        expect(host).to_be_disabled()
+        # The disabled-fields explanation renders in its own neutral
+        # `.drawer-field-reason` element, not `.assignment-error` — that
+        # one is reserved for a genuinely failed save, so a normal
+        # explanation doesn't paint red.
+        expect(page.locator('[data-field="fields-reason"]')).to_contain_text(_WORKER_OWNED_REASON)
+        expect(page.locator('[data-field="error"]')).to_be_hidden()
+
+        # The Tags field is disabled-with-reason exactly like the Assignee
+        # select, and its lifecycle tag (agent-running) never shows as an
+        # editable token.
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_be_disabled()
+        expect(tags).to_have_value("")
+        expect(page.locator('[data-field="tags-reason"]')).to_contain_text(_WORKER_OWNED_REASON)
+
+        # Kill is offered (there's no linked session in this fixture, so it
+        # isn't here) but no Resolve/Accept — Cancel is the only mutation
+        # left available on a claimed card.
+        expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_visible()
+
+    def test_claimed_no_assignee_card_disables_pickers_but_cancel_still_works(self, page: Page, agents_base_url):
+        """A claimed card with no engine assignee (lifecycle claim tags
+        only): every picker is disabled with a reason, exactly like an
+        engine-assigned claimed card, but Cancel is enabled and posts —
+        the one recovery action left with no assignee tag to edit."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append(_claimed_no_assignee_card())
+        cancel_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, cancel_calls=cancel_calls)
+
+        page.locator('[data-card-id="t12"]').click()
+        assignee = page.locator(".drawer-assignee")
+        expect(assignee).to_be_disabled()
+        expect(page.locator('[data-field="assignee-reason"]')).to_contain_text(_WORKER_OWNED_REASON)
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_be_disabled()
+        expect(page.locator('[data-field="fields-reason"]')).to_contain_text(_WORKER_OWNED_REASON)
+
+        cancel_btn = page.get_by_role("button", name="Cancel", exact=True)
+        expect(cancel_btn).to_be_visible()
+        expect(cancel_btn).to_be_enabled()
+        cancel_btn.click()
+        expect(page.locator(".toast")).to_contain_text("Cancelled.", timeout=5000)
+        assert cancel_calls == ["t12"]
+
+    def test_typing_a_lifecycle_tag_into_tags_field_is_rejected(self, page: Page, agents_base_url):
+        """A human must not be able to grant/strip a worker lifecycle tag
+        by typing it into the free-text Tags field — rejected the same
+        way an assignee name already is, on an otherwise-editable
+        (unclaimed, `me`-assigned) card."""
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()  # t2: tags=["me"], unclaimed
+        tags = page.locator(".drawer-tags")
+        tags.fill("agent-running foo")
+        page.locator(".drawer-title").click()  # blur the tags field
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(tags).to_have_value("foo")
+        assert any(sorted(p.get("tags") or []) == ["foo", "me"] for p in task_puts), task_puts
+        assert not any("agent-running" in (p.get("tags") or []) for p in task_puts)
+
+    def test_review_card_tags_edit_preserves_agent_completed_tag(self, page: Page, agents_base_url):
+        """A Review card (agent-completed, not yet accepted) is
+        not claimed, so its Tags field stays editable — but the field
+        never shows `agent-completed` as an editable token, and saving it
+        must always re-append that tag from the card instead of silently
+        dropping it."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"].append({
+            "kind": "task", "id": "t10", "title": "Pending review",
+            "notes": "", "status": "done", "tags": ["codex", "agent-completed"], "assignee": "codex",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+            "policy": {
+                "claimed": False, "agent_owned": True,
+                "cancel": _allowed(False, "accept or reject the review"),
+                "assignee": _allowed(True), "fields": _allowed(True),
+                "lanes": {
+                    "in_progress": _allowed(False, "accept the review first"),
+                    "human_queue": _allowed(False, "accept the review first"),
+                    "review": _allowed(False, "lane 'review' cannot be set directly"),
+                },
+            },
+        })
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+
+        page.locator('[data-card-id="t10"]').click()
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_be_enabled()
+        expect(tags).to_have_value("")  # agent-completed never shows as an editable token
+        tags.fill("urgent")
+        page.locator(".drawer-title").click()  # blur
+        assert any(
+            sorted(p.get("tags") or []) == ["agent-completed", "codex", "urgent"] for p in task_puts
+        ), task_puts
+
+    def test_dropping_on_scheduled_is_refused_locally_with_zero_requests(self, page: Page, agents_base_url):
+        """Scheduled is never a direct drag target — refused client-side
+        via `DIRECT_LANE_IDS`, with zero network round-trip, matching
+        every other structurally-unreachable lane."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        lane_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, lane_calls=lane_calls)
+
+        _drag_card(page, "t8", "scheduled")
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert lane_calls == []
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t8"]')).to_be_visible()
+
+    def test_cancel_refreshes_the_open_drawer_so_a_stale_open_button_cant_409(self, page: Page, agents_base_url):
+        """Cancel re-renders the open drawer explicitly, like the
+        assignee handler already does — fetchBoard()'s own
+        updateOpenDrawer skips the rebuild while the just-clicked Cancel
+        button (inside the drawer) still holds focus, so without an
+        explicit re-render the drawer keeps showing a stale Open button
+        for a card that just moved to Done, and clicking it would 409."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        cancel_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, cancel_calls=cancel_calls)
+
+        page.locator('[data-card-id="t8"]').click()
+        expect(page.get_by_role("button", name="Open", exact=True)).to_be_visible()
+
+        page.get_by_role("button", name="Cancel", exact=True).click()
+        expect(page.locator(".toast")).to_contain_text("Cancelled.", timeout=5000)
+        assert cancel_calls == ["t8"]
+        expect(page.get_by_role("button", name="Open", exact=True)).to_have_count(0)
+
+    def test_resolve_button_offered_when_done_lane_absent_from_policy_meaning_allowed(self, page: Page, agents_base_url):
+        """`policy.lanes` lists only refused lanes, so a human_queue card
+        whose Done move IS allowed has no "done" key in `policy.lanes` at
+        all (absent = allowed) — the Resolve gate treats that as allowed,
+        not by reading `.allowed` off `undefined`."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["human_queue"].append({
+            "kind": "task", "id": "t12", "title": "Handled by hand",
+            "notes": "", "status": "blocked", "tags": ["human", "me"], "assignee": "me",
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+            "policy": {
+                "claimed": False, "agent_owned": False,
+                "cancel": _allowed(False, "cancel is only available for agent-assigned cards"),
+                "assignee": _allowed(True), "fields": _allowed(True),
+                "lanes": {"review": _allowed(False, "lane 'review' cannot be set directly")},
+            },
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t12"]').click()
+        expect(page.get_by_role("button", name="Resolve", exact=True)).to_be_visible()
+
+    def test_cancel_with_an_untorn_down_cli_session_toasts_a_warning(self, page: Page, agents_base_url):
+        """When Cancel's response carries `failures` (a live CLI session
+        it couldn't kill), the toast says so instead of a plain
+        'Cancelled.' success."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        cancel_calls = []
+        _open_board(
+            page, agents_base_url, board_state=board_state, cancel_calls=cancel_calls,
+            cancel_failures=[{"session_id": "cx:live1", "reason": "a live codex CLI session (cx:live1) is still open"}],
+        )
+
+        page.locator('[data-card-id="t8"]').click()
+        page.get_by_role("button", name="Cancel", exact=True).click()
+        expect(page.locator(".toast.error")).to_contain_text("cx:live1", timeout=5000)
+        assert cancel_calls == ["t8"]
+
+    def test_cancel_button_disabled_with_reason_for_a_me_card_with_cancel_refused(self, page: Page, agents_base_url):
+        """The production-shaped case: a `me`-assigned card carries a real
+        `policy.cancel = {allowed: false, reason: ...}` block (every task
+        card does), not no policy at all. A control on a card with a real
+        policy block is never hidden when refused — it renders disabled,
+        with the server's reason visible next to it, the same as every
+        other refused control in this drawer."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t11", "title": "My own task",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+            "policy": {
+                "claimed": False, "agent_owned": False,
+                "cancel": _allowed(False, "cancel is only available for agent-assigned cards"),
+                "assignee": _allowed(True), "fields": _allowed(True),
+                "lanes": {},
+            },
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t11"]').click()
+        cancel_btn = page.get_by_role("button", name="Cancel", exact=True)
+        expect(cancel_btn).to_be_visible()
+        expect(cancel_btn).to_be_disabled()
+        expect(page.locator('[data-field="cancel-reason"]')).to_contain_text(
+            "cancel is only available for agent-assigned cards"
+        )
+
+    def test_cancel_on_unclaimed_agent_card_posts_and_lands_in_done(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        cancel_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, cancel_calls=cancel_calls)
+
+        page.locator('[data-card-id="t8"]').click()
+        page.get_by_role("button", name="Cancel", exact=True).click()
+        expect(page.locator(".toast")).to_contain_text("Cancelled.", timeout=5000)
+        assert cancel_calls == ["t8"]
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t8"]')).to_have_count(0)
+        page.locator('[data-action="drawer-close"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+        # Done is hidden by the default lane filter, and a cancelled card
+        # within it is further hidden behind "include cancelled" — reveal
+        # both to check (the card's `status` went to "cancelled", matching
+        # the real cancel endpoint's write).
+        _check_only_lanes(page, LANE_IDS)
+        page.locator("#board-filter-done").check()
+        expect(page.locator('.board-lane[data-lane="done"] [data-card-id="t8"]')).to_be_visible(timeout=5000)
+
+    def test_cancel_button_absent_when_policy_forbids_it(self, page: Page, agents_base_url):
+        """A plain `me`-assigned card (t2 in the fixture) has no `policy`
+        block at all — Cancel must not appear (defaults to not-offered,
+        never shown speculatively)."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.get_by_role("button", name="Cancel", exact=True)).to_have_count(0)
+
+    def test_removing_agent_marker_tag_leaves_other_editable_tags_via_tags_box(self, page: Page, agents_base_url):
+        """`agent` is an ordinary operator label, not a lifecycle tag."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t13", "title": "Operator queue card",
+            "notes": "", "status": "todo",
+            "tags": ["me", "agent", "agent-notes", "notes"], "assignee": "me",
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+
+        page.locator('[data-card-id="t13"]').click()
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_be_enabled()
+        expect(tags).to_have_value("agent agent-notes notes")
+
+        tags.fill("agent-notes notes")  # remove "agent"
+        page.locator(".drawer-title").click()  # blur the tags field
+        assert any(
+            sorted(p.get("tags") or []) == ["agent-notes", "me", "notes"] for p in task_puts
+        ), task_puts
+        assert not any("agent" in (p.get("tags") or []) for p in task_puts)
+
+    def test_kill_disabled_for_a_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
+        """RC1's positive case, missing until now: a claimed card whose
+        linked session is a live Claude Code CLI pane (opened via the
+        drawer's Open button, not started by the worker) renders Kill
+        disabled with the "close it manually" reason — Kill has no way to
+        tear down a CLI process the way it kills a LifeOS-agent session,
+        the same limitation Cancel already reports for the same shape."""
+        board_state = copy.deepcopy(_board_fixture())
+        card = _claimed_agent_owned_card(card_id="t14", title="CLI-backed claimed card")
+        card["session"] = {
+            "session_id": "cc:cli-live-1", "status": "running",
+            "host": "test-host", "routing": "claude_code",
+            "model_label": "Sonnet", "source": "claude_code",
+        }
+        board_state["lanes"]["in_progress"].append(card)
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        page.locator('[data-card-id="t14"]').click()
+        kill_btn = page.get_by_role("button", name="Kill", exact=True)
+        expect(kill_btn).to_be_visible()
+        expect(kill_btn).to_be_disabled()
+        expect(page.locator('[data-field="kill-reason"]')).to_contain_text("close it manually")
+
+    def test_tags_blur_reads_fresh_board_state_after_a_deferred_frame(self, page: Page, agents_base_url):
+        """AR1's client half, missing until now: the Tags-box blur handler
+        must read the CURRENT board state (`findCard(card.id)`), not the
+        stale card snapshot closed over at render time — otherwise a claim
+        tag the worker writes while the operator is mid-edit in this field
+        gets silently dropped on save instead of preserved. Follows the
+        established deferred-frame pattern (see TestLiveUpdates): the
+        frame is withheld behind `stream_gate` until the drawer is open and
+        the Tags field holds focus, and an unrelated card (t1) carries the
+        proof-of-arrival signal since the drawer itself doesn't rebuild
+        while focused."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t15", "title": "Unclaimed claude card",
+            "notes": "", "status": "todo", "tags": ["claude", "notes"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_stream_frames: list[str] = []
+        task_puts = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+            task_puts=task_puts,
+        )
+        page.locator('[data-card-id="t15"]').click()
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_have_value("notes")
+        tags.fill("notes extra")  # typed; focus stays in the tags field
+
+        # Signal on a DIFFERENT card (t1) proves the frame actually landed;
+        # the real change is the worker claiming t15 mid-edit.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t15":
+                card["tags"] = ["claude", "agent-running", "notes"]
+                card["status"] = "in_progress"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
+        expect(tags).to_have_value("notes extra")  # drawer not rebuilt while focused
+
+        page.locator(".drawer-title").click()  # blur the tags field
+        assert any("agent-running" in (p.get("tags") or []) for p in task_puts), task_puts
+
+
+class TestDeleteCard:
+    """Delete on the drawer, behind a confirmation — a task card, a
+    scheduled card, and (the sequencing case) a task card whose linked
+    session is still live, which the confirmation kills before the
+    delete goes through."""
+
+    def test_unclaimed_task_card_deletes_after_confirmation(self, page: Page, agents_base_url):
+        task_deletes = []
+        kill_calls = []
+        _open_board(page, agents_base_url, task_deletes=task_deletes, kill_calls=kill_calls)
+
+        page.locator('[data-card-id="t1"]').click()  # t1: unassigned, no session
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator("#delete-title")).to_be_visible()
+        expect(page.locator(".modal .target")).to_contain_text("Investigate outage")
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert task_deletes == ["t1"]
+        assert kill_calls == []
+        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+    def test_delete_kills_the_session_claimed_while_the_drawer_was_focused(self, page: Page, agents_base_url):
+        """The confirm handler must resolve the kill decision from the
+        live board, not the card snapshot the drawer last rendered from —
+        `updateOpenDrawer` skips rebuilding the drawer while it holds
+        focus, so a card the worker claims after the drawer opened (while
+        the operator's caret sits in the Notes field) still shows a
+        session-less snapshot there. Follows the established
+        deferred-frame pattern (see TestLiveUpdates /
+        test_tags_blur_reads_fresh_board_state_after_a_deferred_frame): the
+        frame is withheld behind `stream_gate` until the drawer is open and
+        Notes holds focus, and an unrelated card (t1) carries the
+        proof-of-arrival signal since the drawer itself doesn't rebuild
+        while focused."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t23", "title": "Unclaimed claude card",
+            "notes": "", "status": "todo", "tags": ["claude"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_stream_frames: list[str] = []
+        task_deletes = []
+        kill_calls = []
+        call_log = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+            task_deletes=task_deletes, kill_calls=kill_calls, call_log=call_log,
+        )
+        page.locator('[data-card-id="t23"]').click()
+        notes = page.locator(".drawer-notes")
+        notes.click()  # focus stays in Notes
+
+        # Signal on a DIFFERENT card (t1) proves the frame actually landed;
+        # the real change is the worker claiming t23 mid-edit. t23 stays in
+        # "assigned" (only its session/status/tags change) — the delete
+        # confirm handler's kill decision only cares whether t23 carries a
+        # live, killable session, not which lane it's grouped under.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t23":
+                card["status"] = "in_progress"
+                card["tags"] = ["claude", "agent-running"]
+                card["session"] = {
+                    "session_id": "s-t23-live", "status": "running",
+                    "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                    "source": "lifeos_agent",
+                }
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
+        expect(notes).to_be_focused()  # drawer not rebuilt while focused
+
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .descendants")).to_contain_text(
+            "kill the running session and its subagents"
+        )
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert kill_calls == ["s-t23-live"]
+        assert task_deletes == ["t23"]
+        # The kill happened before the delete, not merely both happening.
+        assert call_log == [("kill", "s-t23-live"), ("task_delete", "t23")]
+
+    def test_delete_redisclosed_when_a_session_appears_after_the_modal_opens(self, page: Page, agents_base_url):
+        """The confirmation's note is resolved once, when the modal opens.
+        If the card's live session state changes while the confirmation
+        sits open — no drawer focus required, since a live board tick
+        updates the module-level board state regardless — the first
+        Confirm click must not silently kill a session the note never
+        disclosed. It updates the note to the kill wording and re-enables
+        the button instead, requiring a second Confirm."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t24", "title": "Unclaimed card that gets claimed mid-confirmation",
+            "notes": "", "status": "todo", "tags": ["claude"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_stream_frames: list[str] = []
+        task_deletes = []
+        kill_calls = []
+        call_log = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+            task_deletes=task_deletes, kill_calls=kill_calls, call_log=call_log,
+        )
+        page.locator('[data-card-id="t24"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .descendants")).to_contain_text("This can't be undone.")
+        expect(page.locator(".modal .descendants")).not_to_contain_text(
+            "kill the running session and its subagents"
+        )
+
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t24":
+                card["status"] = "in_progress"
+                card["tags"] = ["claude", "agent-running"]
+                card["session"] = {
+                    "session_id": "s-t24-live", "status": "running",
+                    "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                    "source": "lifeos_agent",
+                }
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
+
+        # First confirm click: redisclose rather than silently kill.
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".modal .descendants")).to_contain_text(
+            "kill the running session and its subagents"
+        )
+        expect(page.locator("#delete-confirm")).to_be_enabled()
+        expect(page.locator("#delete-confirm")).to_have_text("Delete")
+        assert kill_calls == []
+        assert task_deletes == []
+        assert call_log == []
+
+        # Second confirm click: the note now promises the kill, so it happens.
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert kill_calls == ["s-t24-live"]
+        assert task_deletes == ["t24"]
+        assert call_log == [("kill", "s-t24-live"), ("task_delete", "t24")]
+
+    def test_claimed_task_card_with_live_session_kills_before_deleting(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append({
+            "kind": "task", "id": "t20", "title": "Claimed with a live worker session",
+            "notes": "", "status": "in_progress", "tags": ["claude", "agent-running"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t20", "status": "running",
+                "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                "source": "lifeos_agent",
+            },
+            "pending_question": None,
+        })
+        task_deletes = []
+        kill_calls = []
+        call_log = []
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            task_deletes=task_deletes, kill_calls=kill_calls, call_log=call_log,
+        )
+
+        page.locator('[data-card-id="t20"]').click()
+        # The linked-session panel renders into the drawer's session-panel
+        # container while the card is open.
+        expect(page.locator('[data-field="session-panel"] .panel-header')).to_be_visible()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .descendants")).to_contain_text(
+            "kill the running session and its subagents"
+        )
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert kill_calls == ["s-t20"]
+        assert task_deletes == ["t20"]
+        # The kill happened before the delete, not merely both happening.
+        assert call_log == [("kill", "s-t20"), ("task_delete", "t20")]
+        expect(page.locator('[data-card-id="t20"]')).to_have_count(0)
+        # A successful delete tears the session panel down through the
+        # drawer's own close path rather than leaving it for a later
+        # board refresh to clean up.
+        expect(page.locator('[data-field="session-panel"] .panel-header')).to_have_count(0)
+
+    def test_scheduled_card_deletes_through_the_scheduler_endpoint(self, page: Page, agents_base_url):
+        task_deletes = []
+        schedule_deletes = []
+        kill_calls = []
+        _open_board(
+            page, agents_base_url, task_deletes=task_deletes,
+            schedule_deletes=schedule_deletes, kill_calls=kill_calls,
+        )
+
+        page.locator('[data-card-id="s1"]').click()  # s1: scheduled, "Morning briefing"
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .target")).to_contain_text("Morning briefing")
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert schedule_deletes == ["s1"]
+        assert task_deletes == []
+        assert kill_calls == []
+        expect(page.locator('[data-card-id="s1"]')).to_have_count(0)
+
+    def test_kill_failure_blocks_the_delete_and_reenables_the_confirm_button(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append({
+            "kind": "task", "id": "t20", "title": "Claimed with a live worker session",
+            "notes": "", "status": "in_progress", "tags": ["claude", "agent-running"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t20", "status": "running",
+                "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                "source": "lifeos_agent",
+            },
+            "pending_question": None,
+        })
+        task_deletes = []
+        kill_calls = []
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            task_deletes=task_deletes, kill_calls=kill_calls, kill_status_code=[500],
+        )
+
+        page.locator('[data-card-id="t20"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        page.locator("#delete-confirm").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert kill_calls == ["s-t20"]
+        assert task_deletes == []
+        expect(page.locator("#delete-title")).to_be_visible()
+        confirm_btn = page.locator("#delete-confirm")
+        expect(confirm_btn).to_be_enabled()
+        expect(confirm_btn).to_have_text("Delete")
+        expect(page.locator('[data-card-id="t20"]')).to_be_visible()
+
+    def test_kill_reported_failure_blocks_the_delete_and_reenables_the_confirm_button(self, page: Page, agents_base_url):
+        """A 2xx kill response can still report the session under
+        `failures` (the kill endpoint said OK but didn't actually tear
+        anything down) — distinct from `kill_status_code`'s transport
+        failure above, and the delete must not proceed on this branch
+        either."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append({
+            "kind": "task", "id": "t20", "title": "Claimed with a live worker session",
+            "notes": "", "status": "in_progress", "tags": ["claude", "agent-running"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t20", "status": "running",
+                "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                "source": "lifeos_agent",
+            },
+            "pending_question": None,
+        })
+        task_deletes = []
+        kill_calls = []
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            task_deletes=task_deletes, kill_calls=kill_calls,
+            kill_failures=[{"session_id": "s-t20", "reason": "process wouldn't die"}],
+        )
+
+        page.locator('[data-card-id="t20"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        page.locator("#delete-confirm").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(page.locator(".toast.error")).to_contain_text("process wouldn't die")
+        assert kill_calls == ["s-t20"]
+        assert task_deletes == []
+        expect(page.locator("#delete-title")).to_be_visible()
+        confirm_btn = page.locator("#delete-confirm")
+        expect(confirm_btn).to_be_enabled()
+        expect(confirm_btn).to_have_text("Delete")
+        expect(page.locator('[data-card-id="t20"]')).to_be_visible()
+
+    def test_cancelling_the_confirmation_changes_nothing(self, page: Page, agents_base_url):
+        task_deletes = []
+        kill_calls = []
+        _open_board(page, agents_base_url, task_deletes=task_deletes, kill_calls=kill_calls)
+
+        page.locator('[data-card-id="t1"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator("#delete-title")).to_be_visible()
+
+        page.locator("#delete-cancel").click()
+        expect(page.locator("#delete-title")).to_have_count(0)
+        assert task_deletes == []
+        assert kill_calls == []
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
+    def test_review_lane_card_offers_delete_with_the_same_confirmation(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"].append({
+            "kind": "task", "id": "t22", "title": "Awaiting review",
+            "notes": "", "status": "done", "tags": ["agent-completed"], "assignee": "codex",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        task_deletes = []
+        _open_board(page, agents_base_url, board_state=board_state, task_deletes=task_deletes)
+
+        page.locator('[data-card-id="t22"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator("#delete-title")).to_be_visible()
+        expect(page.locator(".modal .target")).to_contain_text("Awaiting review")
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert task_deletes == ["t22"]
+
+    def test_cli_backed_live_session_deletes_without_a_kill_call(self, page: Page, agents_base_url):
+        """A live Claude Code/Codex CLI pane can't be torn down by the kill
+        endpoint (the same limitation Kill and Cancel already report for
+        this session shape) — the confirmation doesn't promise a kill and
+        deleting removes the card without attempting one."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append({
+            "kind": "task", "id": "t21", "title": "CLI-backed claimed card",
+            "notes": "", "status": "in_progress", "tags": ["claude", "agent-running"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "cc:cli-live-1", "status": "running",
+                "host": "test-host", "routing": "claude_code", "model_label": "Sonnet", "source": "claude_code",
+            },
+            "pending_question": None,
+        })
+        task_deletes = []
+        kill_calls = []
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            task_deletes=task_deletes, kill_calls=kill_calls,
+        )
+
+        page.locator('[data-card-id="t21"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .descendants")).not_to_contain_text(
+            "kill the running session and its subagents"
+        )
+        expect(page.locator(".modal .descendants")).to_contain_text("close its pane manually")
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert kill_calls == []
+        assert task_deletes == ["t21"]
