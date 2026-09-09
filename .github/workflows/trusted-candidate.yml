@@ -1,0 +1,55 @@
+name: trusted candidate verifier
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  group: trusted-candidate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  execute:
+    name: trusted-candidate-execution
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      - name: Verify exact untrusted candidate with no credentials or secrets
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test ! -f FAIL_MARKER.txt
+
+  publish:
+    name: trusted-candidate-publisher
+    needs: [execute]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          RESULT: ${{ needs.execute.result }}
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'trusted-candidate-verification',
+              head_sha: process.env.CANDIDATE_SHA,
+              status: 'completed',
+              conclusion: process.env.RESULT === 'success' ? 'success' : 'failure',
+              output: {title: 'Trusted candidate verifier', summary: process.env.RESULT},
+            });
