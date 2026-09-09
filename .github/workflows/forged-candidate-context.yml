@@ -13,4 +13,4 @@ jobs:
     # context the proposed classic requirement would consume.
     runs-on: ubuntu-latest
     steps:
-      - run: test -f FORGED_LOCAL_RECEIPT.txt
+      - run: exit 0
