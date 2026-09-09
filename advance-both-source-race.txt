@@ -1,1 +1,1 @@
-synthetic advance-both source initial
+synthetic advance-both source newer fast-forward
