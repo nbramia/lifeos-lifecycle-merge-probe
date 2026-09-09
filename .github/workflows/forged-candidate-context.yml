@@ -1,0 +1,16 @@
+name: forged candidate context
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-verification:
+    # Synthetic attacker-controlled job: it deliberately creates the exact
+    # context the proposed classic requirement would consume.
+    runs-on: ubuntu-latest
+    steps:
+      - run: test -f FORGED_LOCAL_RECEIPT.txt
