@@ -1,7 +1,9 @@
 """Tests for dependency-skip behavior and LLM memory gating in run_all_syncs."""
 
+import functools
 import subprocess
 import sys
+import tempfile
 import time
 import logging
 from pathlib import Path
@@ -12,6 +14,30 @@ import pytest
 pytestmark = pytest.mark.unit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@functools.lru_cache(maxsize=1)
+def _git_backed_repo_root() -> Path:
+    """REPO_ROOT has no .git when this test runs inside an isolated
+    verifier snapshot (scripts/candidate_snapshot.py's build_snapshot never
+    copies .git, by design), but build_snapshot itself requires a git
+    source to enumerate from. Stage the exact current content into an
+    owned disposable git repo instead; cached, since rebuilding a
+    repo-sized copy per call would be wasteful and the content is fixed
+    for this process's lifetime."""
+    if (REPO_ROOT / ".git").exists():
+        return REPO_ROOT
+    fixture = Path(tempfile.mkdtemp(prefix="lifeos-sync-snapshot-fixture-"))
+    subprocess.run(["rsync", "-a", "--exclude=.git", f"{REPO_ROOT}/", f"{fixture}/"], check=True)
+    subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=fixture, check=True)
+    # Gitignored-but-force-tracked in the real repo (see .gitignore's own
+    # comments on these two entries) -- a fresh `git add -A` in a brand-new
+    # repo has no tracked-history override for either.
+    for forced in ("AGENTS.md", "tests/test_p91_data_integrity.py"):
+        if (fixture / forced).exists():
+            subprocess.run(["git", "add", "-f", "--", forced], cwd=fixture, check=True)
+    return fixture
 
 
 @pytest.fixture(autouse=True)
@@ -103,7 +129,7 @@ def test_import_does_not_create_timestamped_sync_log(tmp_path):
     from scripts.candidate_snapshot import build_snapshot
 
     fresh_source = tmp_path / "fresh-source"
-    build_snapshot(REPO_ROOT, fresh_source)
+    build_snapshot(_git_backed_repo_root(), fresh_source)
     log_dir = fresh_source / "logs"
     assert not log_dir.exists()
     result = subprocess.run(

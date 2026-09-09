@@ -34,7 +34,8 @@ from scripts.development_metrics import MetricsRecorder
 from scripts.test_capacity import CapacityError, CapacityManager
 from scripts.test_instance import TestInstance, run_supervised_command
 from scripts.verification_evidence import (
-    EvidenceError, EvidenceStore, LaneOutcome, VerificationInputs,
+    EvidenceError, EvidenceStore, LaneOutcome, PRIVACY_AUDIT_NODEID,
+    PRIVACY_AUDIT_NOT_APPLICABLE_REASON, VerificationInputs,
     fingerprint_named_files, safe_environment_fingerprint,
 )
 from scripts.test_lane_registry import BY_NAME, EXECUTION_ORDER, marker
@@ -74,6 +75,15 @@ def _snapshot_modes_ok(snapshot: SnapshotResult) -> tuple[bool, list[str]]:
     """Use candidate_snapshot's shared byte/mode/runtime mismatch policy."""
     ok, mismatches = verify_snapshot_unmodified(snapshot)
     return ok, [str(mismatch) for mismatch in mismatches]
+
+
+def _bounded_snapshot_diagnostics(mismatches: Sequence[str]) -> list[str]:
+    """Fit strict snapshot receipts without replacing an integrity failure."""
+    if len(mismatches) > 20:
+        details = [*mismatches[:19], f"... {len(mismatches) - 19} additional snapshot mismatches omitted"]
+    else:
+        details = list(mismatches)
+    return [detail[:512] for detail in details]
 
 
 def _resolve_playwright_browsers_path() -> str:
@@ -466,13 +476,38 @@ def pytest_lane_executor(
             if lane_log_dir is None:
                 receipt.unlink(missing_ok=True)
         reports = execution.get("reports")
+        candidates = execution.get("not_applicable_candidates", {})
+        not_applicable: tuple[tuple[str, str], ...] = ()
+        if not isinstance(candidates, dict):
+            return LaneOutcome(lane, nodeids, result.returncode, "failure")
+        expected_candidate = {PRIVACY_AUDIT_NODEID: PRIVACY_AUDIT_NOT_APPLICABLE_REASON}
+        if candidates:
+            if (
+                candidates != expected_candidate
+                or not isinstance(reports, dict)
+                or PRIVACY_AUDIT_NODEID not in nodeids
+                or reports.get(PRIVACY_AUDIT_NODEID) != "skipped"
+            ):
+                return LaneOutcome(lane, nodeids, result.returncode, "failure")
+            not_applicable = ((PRIVACY_AUDIT_NODEID, PRIVACY_AUDIT_NOT_APPLICABLE_REASON),)
+        passed_count = sum(1 for nodeid in nodeids if isinstance(reports, dict) and reports.get(nodeid) == "passed")
         complete = (
             execution.get("status") == "success"
             and isinstance(reports, dict)
             and set(reports) == set(nodeids)
-            and all(reports[nodeid] == "passed" for nodeid in nodeids)
+            and passed_count > 0
+            and all(
+                reports[nodeid] == "passed"
+                or (nodeid == PRIVACY_AUDIT_NODEID and bool(not_applicable))
+                for nodeid in nodeids
+            )
         )
-        return LaneOutcome(lane, nodeids, result.returncode, "success" if complete and result.returncode == 0 else "failure")
+        outcome_result = "success" if complete and result.returncode == 0 else "failure"
+        return LaneOutcome(
+            lane, nodeids, result.returncode,
+            outcome_result,
+            not_applicable=not_applicable if outcome_result == "success" else (),
+        )
     setattr(execute, "bind_snapshot", bind_snapshot)
     return execute
 
@@ -594,7 +629,7 @@ def verify_candidate(
         if not valid:
             store.record(
                 inputs, outcomes, result="incomplete", retry_reason=retry_reason,
-                diagnostics=mismatches,
+                diagnostics=_bounded_snapshot_diagnostics(mismatches),
             )
             recorded = True
             raise CandidateVerificationError("snapshot changed during execution: " + "; ".join(mismatches[:3]))

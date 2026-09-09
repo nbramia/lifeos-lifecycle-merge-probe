@@ -163,13 +163,17 @@ def test_sourcing_does_not_run_main(tmp_path: Path):
 def _git_ls_files_mode(path: Path, tmp_path: Path) -> str:
     """`git ls-files -s` reports the INDEX mode, distinct from the file's
     own filesystem stat() bit -- the check this exists for. Run against
-    REPO_ROOT when it's a real git checkout (catches a bad index entry
-    even when a local `chmod +x` masks it on the working-tree copy); when
-    REPO_ROOT has no `.git` (an isolated verifier snapshot, which never
-    includes one -- see scripts/candidate_snapshot.py), stage the file's
-    own preserved content into an owned disposable repo instead, so the
-    check still exercises real `git add`/`ls-files` index behavior on this
-    exact file rather than erroring out."""
+    REPO_ROOT when it's a real git checkout: this proves the actual
+    committed index entry, catching a bad index entry even when a local
+    `chmod +x` masks it on the working-tree copy. When REPO_ROOT has no
+    `.git` (an isolated verifier snapshot, which never includes one -- see
+    scripts/candidate_snapshot.py), there is no original index entry
+    available to check at all; stage this file's own snapshotted content
+    and executable mode into an owned disposable repo instead, so the
+    check exercises real `git add`/`ls-files` mechanics on that
+    snapshotted state rather than erroring out -- this proves the
+    snapshotted content's mode round-trips through git correctly, not the
+    original repository's committed index entry."""
     if (REPO_ROOT / ".git").exists():
         return subprocess.run(
             ["git", "ls-files", "-s", "--", str(path)],

@@ -18,6 +18,11 @@ from typing import Any, Mapping, Sequence
 
 SCHEMA_VERSION = 1
 TERMINAL_FAILURES = frozenset({"failure", "cancelled", "incomplete", "infrastructure_failure"})
+PRIVACY_AUDIT_NODEID = "tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value"
+PRIVACY_AUDIT_NOT_APPLICABLE_REASON = (
+    "No real .env reachable from this checkout -- nothing to check "
+    "fixtures against (expected on a fresh clone or CI)."
+)
 SAFE_ENVIRONMENT_NAMES = frozenset({
     "LIFEOS_TEST_PARALLEL_WORKERS", "PYTHONHASHSEED", "PYTHONDONTWRITEBYTECODE", "LIFEOS_PARALLEL_BROWSER_FREE",
 })
@@ -77,15 +82,26 @@ class LaneOutcome:
     nodeids: tuple[str, ...]
     exit_status: int
     result: str
+    not_applicable: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.lane or not self.nodeids or self.exit_status is None:
             raise EvidenceError("lane outcome must name executed tests and an exit status")
         if self.result not in {"success", "failure", "cancelled", "incomplete", "infrastructure_failure"}:
             raise EvidenceError("invalid lane result")
+        if self.not_applicable not in ((), ((PRIVACY_AUDIT_NODEID, PRIVACY_AUDIT_NOT_APPLICABLE_REASON),)):
+            raise EvidenceError("invalid not-applicable outcome")
+        if self.not_applicable and self.result != "success":
+            raise EvidenceError("not-applicable outcome cannot mask a lane failure")
+        if self.not_applicable and self.not_applicable[0][0] not in self.nodeids:
+            raise EvidenceError("not-applicable node was not selected")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"lane": self.lane, "nodeids": list(self.nodeids), "exit_status": self.exit_status, "result": self.result}
+        payload = {"lane": self.lane, "nodeids": list(self.nodeids), "exit_status": self.exit_status, "result": self.result}
+        if self.not_applicable:
+            nodeid, reason = self.not_applicable[0]
+            payload["not_applicable"] = {"nodeid": nodeid, "reason": reason}
+        return payload
 
 
 def safe_environment_fingerprint(values: Mapping[str, str]) -> str:
@@ -219,4 +235,4 @@ class EvidenceStore:
             os.close(fd)
 
 
-__all__ = ["EvidenceError", "EvidenceStore", "LaneOutcome", "VerificationInputs", "fingerprint_named_files", "safe_environment_fingerprint"]
+__all__ = ["EvidenceError", "EvidenceStore", "LaneOutcome", "PRIVACY_AUDIT_NODEID", "PRIVACY_AUDIT_NOT_APPLICABLE_REASON", "VerificationInputs", "fingerprint_named_files", "safe_environment_fingerprint"]

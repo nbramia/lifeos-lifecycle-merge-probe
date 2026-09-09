@@ -21,6 +21,7 @@ from scripts.verify_candidate import (
 from scripts.development_metrics import MetricsRecorder, read_records
 from scripts.test_capacity import CapacityManager
 from scripts.verification_evidence import EvidenceStore, LaneOutcome, VerificationInputs, safe_environment_fingerprint
+from scripts.verification_evidence import PRIVACY_AUDIT_NODEID, PRIVACY_AUDIT_NOT_APPLICABLE_REASON
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -125,6 +126,23 @@ def test_snapshot_mutation_during_execution_records_incomplete_not_success(tmp_p
     attempt = json.loads(receipts[0].read_text())["attempts"][-1]
     assert attempt["result"] == "incomplete"
     assert attempt["diagnostics"] == ["app.py (content changed)"]
+
+
+@pytest.mark.unit
+def test_snapshot_mutation_with_more_than_twenty_paths_retains_incomplete_receipt(tmp_path):
+    root = _source_repo(tmp_path)
+
+    def mutating(snapshot: Path, lane: str, nodeids: tuple[str, ...]) -> LaneOutcome:
+        for index in range(21):
+            (snapshot / f"changed-{index:02}.py").write_text("mutated during test\n")
+        return LaneOutcome(lane, nodeids, 0, "success")
+
+    with pytest.raises(CandidateVerificationError, match="changed during execution"):
+        _verify(root, tmp_path, executor=mutating)
+    attempt = json.loads(next((tmp_path / "evidence").glob("*.json")).read_text())["attempts"][-1]
+    assert attempt["result"] == "incomplete"
+    assert len(attempt["diagnostics"]) == 20
+    assert attempt["diagnostics"][-1] == "... 2 additional snapshot mismatches omitted"
 
 
 @pytest.mark.unit
@@ -645,6 +663,42 @@ def test_pytest_lane_adapter_fails_closed_for_missing_malformed_and_bad_reports(
         )
         assert outcome.result == expected_result
         assert outcome.result != "success"
+
+
+@pytest.mark.unit
+def test_pytest_lane_adapter_allows_only_the_named_privacy_audit_not_applicable(monkeypatch, tmp_path):
+    import scripts.verify_candidate as verifier
+
+    mandatory = "tests/test_synthetic.py::test_mandatory"
+
+    def execute(receipt_body):
+        def fake_run(command, **_kwargs):
+            receipt = Path(command[command.index("--lifeos-lane-execution") + 1])
+            receipt.write_text(json.dumps(receipt_body))
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(verifier, "run_supervised_command", fake_run)
+        environment = make_hermetic_environment(tmp_path / str(len(str(receipt_body))), workers=1)
+        return pytest_lane_executor(environment, workers=1)(
+            tmp_path, "fast-unit", (PRIVACY_AUDIT_NODEID, mandatory),
+        )
+
+    accepted = execute({
+        "status": "success",
+        "reports": {PRIVACY_AUDIT_NODEID: "skipped", mandatory: "passed"},
+        "not_applicable_candidates": {PRIVACY_AUDIT_NODEID: PRIVACY_AUDIT_NOT_APPLICABLE_REASON},
+    })
+    assert accepted.result == "success"
+    assert accepted.not_applicable == ((PRIVACY_AUDIT_NODEID, PRIVACY_AUDIT_NOT_APPLICABLE_REASON),)
+
+    for receipt_body in (
+        {"status": "success", "reports": {PRIVACY_AUDIT_NODEID: "skipped", mandatory: "passed"}},
+        {"status": "success", "reports": {PRIVACY_AUDIT_NODEID: "skipped", mandatory: "passed"}, "not_applicable_candidates": {PRIVACY_AUDIT_NODEID: "wrong reason"}},
+        {"status": "success", "reports": {PRIVACY_AUDIT_NODEID: "failed", mandatory: "passed"}, "not_applicable_candidates": {PRIVACY_AUDIT_NODEID: PRIVACY_AUDIT_NOT_APPLICABLE_REASON}},
+        {"status": "success", "reports": {mandatory: "passed"}, "not_applicable_candidates": {PRIVACY_AUDIT_NODEID: PRIVACY_AUDIT_NOT_APPLICABLE_REASON}},
+        {"status": "success", "reports": {PRIVACY_AUDIT_NODEID: "skipped", mandatory: "skipped"}, "not_applicable_candidates": {PRIVACY_AUDIT_NODEID: PRIVACY_AUDIT_NOT_APPLICABLE_REASON}},
+    ):
+        assert execute(receipt_body).result == "failure"
 
 
 @pytest.mark.unit

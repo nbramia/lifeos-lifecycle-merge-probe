@@ -10,9 +10,11 @@ never appear in a returned/printed value other than the one deliberate
 """
 from __future__ import annotations
 
+import base64
 import html
 import json
 import socket
+import subprocess
 import threading
 import urllib.error
 import urllib.request
@@ -33,23 +35,21 @@ from scripts.github_app_setup import (
     parse_callback_request,
     store_app_credentials,
     verify_app_installed,
+    _app_jwt,
 )
 
 pytestmark = pytest.mark.unit
 
 
 @pytest.fixture(scope="module")
-def app_private_key_pem() -> str:
-    """A generated test key; no operator credential is embedded in tests."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    return key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    ).decode()
+def app_private_key_pem(tmp_path_factory) -> str:
+    """Generate a disposable test key without embedding any credential."""
+    key_path = tmp_path_factory.mktemp("github-app-jwt") / "app.pem"
+    subprocess.run(
+        ["openssl", "genpkey", "-algorithm", "RSA", "-out", str(key_path), "-pkeyopt", "rsa_keygen_bits:2048"],
+        check=True, capture_output=True, text=True,
+    )
+    return key_path.read_text()
 
 
 def _free_port() -> int:
@@ -224,6 +224,31 @@ def test_verify_app_installed_uses_held_pem_as_an_app_jwt(app_private_key_pem):
     # this process as an argument or output value.
     assert seen["token"].count(".") == 2
     assert app_private_key_pem not in seen["token"]
+
+
+def test_app_jwt_signature_verifies_with_the_generated_public_key(app_private_key_pem, tmp_path):
+    token = _app_jwt(999, app_private_key_pem, now=lambda: 1_700_000_000)
+    header, claims, encoded_signature = token.split(".")
+
+    def decode(value):
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+    assert json.loads(decode(header)) == {"alg": "RS256", "typ": "JWT"}
+    assert json.loads(decode(claims)) == {"iat": 1_699_999_940, "exp": 1_700_000_540, "iss": "999"}
+
+    key_path = tmp_path / "app.pem"
+    public_key = tmp_path / "app.pub"
+    payload = tmp_path / "payload"
+    signature = tmp_path / "signature"
+    key_path.write_text(app_private_key_pem)
+    payload.write_text(f"{header}.{claims}")
+    signature.write_bytes(decode(encoded_signature))
+    subprocess.run(["openssl", "pkey", "-in", str(key_path), "-pubout", "-out", str(public_key)], check=True)
+    verified = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-verify", str(public_key), "-signature", str(signature), str(payload)],
+        check=False, capture_output=True, text=True,
+    )
+    assert verified.returncode == 0, verified.stderr
 
 
 def test_verify_app_installed_false_when_repository_has_no_installation(app_private_key_pem):

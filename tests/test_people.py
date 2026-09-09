@@ -15,15 +15,45 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import api.services.people as people_module
 from api.services.people import (
     PeopleRegistry,
     extract_people_from_text,
     resolve_person_name,
-    PEOPLE_DICTIONARY,
 )
 
 # Most tests in this file are fast unit tests
 pytestmark = pytest.mark.unit
+
+# Obviously-synthetic people-dictionary content (never real names) covering
+# every shape the dictionary-dependent tests below need: 3+ non-excluded
+# names, at least one alias distinct from its canonical name, and both a
+# "work" and a "family" category.
+_SYNTHETIC_PEOPLE_DICTIONARY = {
+    "Alex Chen": {"aliases": ["Al Chen", "Alexandra Chen"], "category": "work"},
+    "Sam Rivera": {"aliases": [], "category": "family"},
+    "Jordan Lee": {"aliases": ["Jordy"], "category": "personal"},
+}
+
+
+def _install_synthetic_people_dictionary(monkeypatch):
+    """api.services.people derives ALIAS_MAP/KNOWN_NAMES from
+    PEOPLE_DICTIONARY once at import time, so resolve_person_name and
+    extract_people_from_text never read PEOPLE_DICTIONARY directly --
+    patching only that name would leave them looking at whatever (usually
+    empty) dictionary was present when this process started. Mirror the
+    module's own derivation so the patched data is fully consistent for
+    every caller, not just the dict lookups this test file makes itself."""
+    alias_map: dict[str, str] = {}
+    known_names: set[str] = set(_SYNTHETIC_PEOPLE_DICTIONARY.keys())
+    for name, info in _SYNTHETIC_PEOPLE_DICTIONARY.items():
+        alias_map[name.lower()] = name
+        for alias in info.get("aliases", []):
+            alias_map[alias.lower()] = name
+            known_names.add(alias)
+    monkeypatch.setattr(people_module, "PEOPLE_DICTIONARY", _SYNTHETIC_PEOPLE_DICTIONARY)
+    monkeypatch.setattr(people_module, "ALIAS_MAP", alias_map)
+    monkeypatch.setattr(people_module, "KNOWN_NAMES", known_names)
 
 
 class TestPeopleExtraction:
@@ -37,20 +67,18 @@ class TestPeopleExtraction:
         assert "Alex" in people
         assert "Sarah" in people
 
-    def test_extracts_names_from_people_dictionary(self):
-        """Should recognize names from the People Dictionary (if configured)."""
-        if not PEOPLE_DICTIONARY:
-            pytest.skip("People dictionary not configured")
+    def test_extracts_names_from_people_dictionary(self, monkeypatch):
+        """Should recognize names from the People Dictionary."""
+        _install_synthetic_people_dictionary(monkeypatch)
 
-        # Use actual names from dictionary for test, skipping excluded names
-        # (names with exclude=True like self-references are filtered out)
+        # Use names from the dictionary for the test, skipping excluded
+        # names (names with exclude=True like self-references are filtered
+        # out) -- none of the synthetic entries are excluded.
         dictionary_names = [
-            name for name, info in PEOPLE_DICTIONARY.items()
+            name for name, info in people_module.PEOPLE_DICTIONARY.items()
             if not info.get("exclude", False)
         ][:3]
-
-        if len(dictionary_names) < 3:
-            pytest.skip("Need at least 3 non-excluded names in dictionary for this test")
+        assert len(dictionary_names) >= 3
 
         # Build test text using names from dictionary (no bold formatting)
         text = f"{dictionary_names[0]} and {dictionary_names[1]} went to the park. {dictionary_names[2]} called."
@@ -101,16 +129,14 @@ class TestAliasResolution:
         resolved = resolve_person_name("Alex")
         assert resolved == "Alex"  # or "Alex Johnson" if we expand
 
-    def test_resolves_misspelling(self):
-        """Should resolve common misspellings (if dictionary configured)."""
-        # This test depends on having a configured people dictionary
-        # with misspelling mappings.
-        if not PEOPLE_DICTIONARY:
-            pytest.skip("People dictionary not configured")
+    def test_resolves_misspelling(self, monkeypatch):
+        """Should resolve common misspellings via a dictionary alias."""
+        _install_synthetic_people_dictionary(monkeypatch)
 
-        # Find a misspelling mapping from the dictionary
+        # Find a misspelling mapping from the dictionary -- the synthetic
+        # dictionary guarantees at least one true alias exists.
         misspelling_found = False
-        for canonical, info in PEOPLE_DICTIONARY.items():
+        for canonical, info in people_module.PEOPLE_DICTIONARY.items():
             aliases = info.get("aliases", [])
             for alias in aliases:
                 if alias.lower() != canonical.lower():  # It's a true alias/misspelling
@@ -121,8 +147,7 @@ class TestAliasResolution:
             if misspelling_found:
                 break
 
-        if not misspelling_found:
-            pytest.skip("No misspelling mappings found in dictionary")
+        assert misspelling_found, "synthetic dictionary must contain a resolvable alias"
 
     def test_resolves_email_to_name(self):
         """Should resolve email addresses to names."""
@@ -180,14 +205,13 @@ class TestPeopleRegistry:
         person = registry.get_person("Kevin")
         assert person["mention_count"] == 3
 
-    def test_categorizes_people(self, registry):
-        """Should categorize people as work/personal/family (if dictionary configured)."""
-        if not PEOPLE_DICTIONARY:
-            pytest.skip("People dictionary not configured")
+    def test_categorizes_people(self, registry, monkeypatch):
+        """Should categorize people as work/personal/family."""
+        _install_synthetic_people_dictionary(monkeypatch)
 
         # Find a work person from dictionary
         work_person = None
-        for name, info in PEOPLE_DICTIONARY.items():
+        for name, info in people_module.PEOPLE_DICTIONARY.items():
             if info.get("category") == "work":
                 work_person = name
                 break
@@ -202,7 +226,7 @@ class TestPeopleRegistry:
 
         # Find a family person from dictionary
         family_person = None
-        for name, info in PEOPLE_DICTIONARY.items():
+        for name, info in people_module.PEOPLE_DICTIONARY.items():
             if info.get("category") == "family":
                 family_person = name
                 break

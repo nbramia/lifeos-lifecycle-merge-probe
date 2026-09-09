@@ -32,6 +32,17 @@ organization/Enterprise-only features — not merely unconfigured, but
 structurally unavailable here regardless of settings changes. Neither is
 part of this design.
 
+## Privacy-audit applicability
+
+`tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value`
+compares committed fixtures with a locally reachable real `.env` without
+loading it into the process environment. In an isolated candidate where that
+file is intentionally inaccessible, only its exact existing no-real-`.env`
+reason is recorded as named `not_applicable`; it is never reported as passed.
+All other skipped, missing, errored, or failed tests remain blocking, and a
+successful lane still requires at least one passed mandatory test; the direct
+checkout/pre-push audit continues to run read-only whenever the `.env` exists.
+
 ## The actual gate: a dedicated App-issued required check
 
 The publisher job is separate from candidate execution. It receives
@@ -150,9 +161,9 @@ ref.
    automated browser session acting on their behalf). The script then
    exchanges the resulting one-time code for real credentials, then checks
    whether the App is actually installed on the target repository using a
-   short-lived App JWT signed in memory from the exchanged key (rather than
-   the CLI user's OAuth installation endpoint)
-   (registering an App and installing it are separate GitHub actions — a
+   short-lived App JWT signed in memory from the exchanged key, rather than
+   the CLI user's OAuth installation endpoint. Registering an App and
+   installing it are separate GitHub actions — a
    fresh App is ordinarily not installed yet). If it isn't, the script
    prints the installation URL and keeps running, polling until
    installation is confirmed — the exchanged private key exists only in
