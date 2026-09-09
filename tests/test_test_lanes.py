@@ -199,6 +199,34 @@ def test_plugin_records_selected_setup_skips_once_in_serial_and_xdist(tmp_path, 
 
 
 @pytest.mark.unit
+def test_plugin_records_only_the_named_privacy_audit_skip_reason(tmp_path):
+    from scripts.verification_evidence import PRIVACY_AUDIT_NODEID, PRIVACY_AUDIT_NOT_APPLICABLE_REASON
+
+    cases = tmp_path / "cases"
+    tests_dir = cases / "tests"
+    tests_dir.mkdir(parents=True)
+    (cases / "pyproject.toml").write_text("[tool.pytest.ini_options]\nmarkers = ['unit']\n")
+    (tests_dir / "test_fixtures_no_personal_data.py").write_text(
+        "import pytest\n\n@pytest.mark.unit\ndef test_no_fixture_contains_a_real_sensitive_value():\n"
+        f"    pytest.skip({PRIVACY_AUDIT_NOT_APPLICABLE_REASON!r})\n"
+    )
+    nodeids = tmp_path / "exact-nodeids.txt"
+    nodeids.write_text(PRIVACY_AUDIT_NODEID + "\n")
+    receipt = tmp_path / "execution.json"
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pytest", "tests", "-q", "-p", "scripts.test_lane_plugin",
+            "--lifeos-lane-nodeids", str(nodeids), "--lifeos-lane-execution", str(receipt),
+        ],
+        capture_output=True, text=True, cwd=cases, env={**os.environ, "PYTHONPATH": str(REPO)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(receipt.read_text())["not_applicable_candidates"] == {
+        PRIVACY_AUDIT_NODEID: PRIVACY_AUDIT_NOT_APPLICABLE_REASON,
+    }
+
+
+@pytest.mark.unit
 def test_auto_fails_for_a_real_present_test_file_with_zero_collected_ids(tmp_path):
     """Auto cannot treat a real pytest exit-5 collection as a skipped lane."""
     copied = tmp_path / "checkout"

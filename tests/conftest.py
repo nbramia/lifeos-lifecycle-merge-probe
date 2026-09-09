@@ -475,6 +475,7 @@ def _isolate_integration_persistent_stores(request, tmp_path, monkeypatch):
         return
 
     import api.services.person_entity as person_entity_mod
+    import api.services.link_override as link_override_mod
     import api.services.sync_health as sync_health_mod
     from api.utils import db_paths
 
@@ -484,9 +485,15 @@ def _isolate_integration_persistent_stores(request, tmp_path, monkeypatch):
     # pytest-owned directory; explicit test paths and skip conditions remain
     # unchanged.
     runtime_data = tmp_path / "runtime"
+    runtime_data.mkdir()
     monkeypatch.setattr(db_paths.settings, "chroma_path", runtime_data / "chromadb")
     monkeypatch.setattr(person_entity_mod.PersonEntityStore, "CRM_DB_PATH", runtime_data / "crm.db")
     monkeypatch.setattr(person_entity_mod, "_entity_store", None)
+    monkeypatch.setattr(
+        link_override_mod,
+        "_link_override_store",
+        link_override_mod.LinkOverrideStore(runtime_data / "crm.db"),
+    )
     monkeypatch.setattr(sync_health_mod, "SYNC_HEALTH_DB_PATH", runtime_data / "sync_health.db")
     yield
 

@@ -9,8 +9,10 @@ from pathlib import Path
 import pytest
 
 from scripts.test_lane_registry import LANES, classify, marker
+from scripts.verification_evidence import PRIVACY_AUDIT_NODEID
 
 _REPORTS: dict[str, str] = {}
+_NOT_APPLICABLE_CANDIDATES: dict[str, str] = {}
 _KEYBOARD_INTERRUPTED = False
 
 
@@ -51,6 +53,7 @@ def pytest_configure(config):
     _configure_output(config, "lifeos_lane_inventory", "_lifeos_lane_inventory")
     _configure_output(config, "lifeos_lane_execution", "_lifeos_lane_execution")
     _REPORTS.clear()
+    _NOT_APPLICABLE_CANDIDATES.clear()
     _KEYBOARD_INTERRUPTED = False
 
 
@@ -96,6 +99,10 @@ def pytest_keyboard_interrupt(excinfo):
 
 
 def pytest_runtest_logreport(report):
+    if report.outcome == "skipped" and report.nodeid == PRIVACY_AUDIT_NODEID:
+        longrepr = report.longrepr
+        reason = longrepr[2] if isinstance(longrepr, tuple) and len(longrepr) == 3 else str(longrepr)
+        _NOT_APPLICABLE_CANDIDATES[report.nodeid] = reason.removeprefix("Skipped: ")
     if report.when == "setup" and report.outcome == "skipped":
         # A setup fixture can terminally skip a selected test, in which case
         # pytest never emits its call report. Preserve that exact selection
@@ -175,5 +182,6 @@ def pytest_sessionfinish(session, exitstatus):
         _write_new_json(execution_output, {
             "status": status,
             "reports": dict(sorted(reports.items())),
+            "not_applicable_candidates": dict(sorted(_NOT_APPLICABLE_CANDIDATES.items())),
             "collected_count": len(session.items),
         })
