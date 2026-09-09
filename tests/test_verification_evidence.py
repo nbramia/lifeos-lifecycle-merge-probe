@@ -16,7 +16,8 @@ import pytest
 
 from scripts.verify_candidate import (
     CandidateVerificationError, _installed_chromium_prerequisite, _installed_dependency_fingerprint,
-    make_hermetic_environment, pytest_lane_executor, verify_candidate, verify_git_ref, verify_pytest_candidate,
+    collect_lane_inventory, make_hermetic_environment, pytest_lane_executor, verify_candidate, verify_git_ref,
+    verify_pytest_candidate,
 )
 from scripts.development_metrics import MetricsRecorder, read_records
 from scripts.test_capacity import CapacityManager
@@ -75,6 +76,23 @@ def _executor(snapshot: Path, lane: str, nodeids: tuple[str, ...]) -> LaneOutcom
         cwd=snapshot,
     )
     return LaneOutcome(lane, nodeids, result.returncode, "success" if result.returncode == 0 else "failure")
+
+
+@pytest.mark.unit
+def test_collection_failure_reports_bounded_real_import_error(tmp_path):
+    """A real pytest import failure reaches the hosted diagnostic without full output."""
+    snapshot = tmp_path / "snapshot"
+    (snapshot / "scripts").mkdir(parents=True)
+    (snapshot / "tests").mkdir()
+    shutil.copy2(REPO / "scripts" / "test_lane_plugin.py", snapshot / "scripts" / "test_lane_plugin.py")
+    shutil.copy2(REPO / "scripts" / "test_lane_registry.py", snapshot / "scripts" / "test_lane_registry.py")
+    shutil.copy2(REPO / "scripts" / "verification_evidence.py", snapshot / "scripts" / "verification_evidence.py")
+    (snapshot / "pyproject.toml").write_text("[tool.pytest.ini_options]\nmarkers = ['unit']\n")
+    (snapshot / "tests" / "test_broken_import.py").write_text("raise ImportError('missing synthetic dependency')\n")
+    with pytest.raises(CandidateVerificationError, match=r"(?s)exit 2.*ImportError: missing synthetic dependency") as exc:
+        collect_lane_inventory(snapshot, tmp_path / "receipts", {"HOME": str(tmp_path / "home")})
+    assert "stdout tail" in str(exc.value)
+    assert len(str(exc.value)) <= 4300
 
 
 def _verify(root: Path, tmp_path: Path, *, executor=_executor, base: str | None = "base-a", environment=None):

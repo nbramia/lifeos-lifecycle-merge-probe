@@ -206,16 +206,34 @@ def collect_lane_inventory(snapshot_root: Path, receipt_dir: Path, environment: 
         capture_output=True,
         env=collection_environment,
     )
+    def output_tail() -> str:
+        # Pytest's normal collection output can contain every node ID, which
+        # is not useful (or bounded) in a hosted job log. Collection tracebacks
+        # normally go to stdout, while launcher errors go to stderr; retain a
+        # short tail of each rather than either whole stream.
+        detail = ""
+        stderr_tail = result.stderr.strip()[-4000:]
+        stdout_tail = result.stdout.strip()[-4000:]
+        if stderr_tail:
+            detail += f"; stderr tail: {stderr_tail}"
+        if stdout_tail:
+            detail += f"; stdout tail: {stdout_tail}"
+        return detail
     try:
         if not os.path.exists(name):
-            raise CandidateVerificationError("lane collection did not produce an inventory")
+            raise CandidateVerificationError(
+                f"lane collection did not produce an inventory (exit {result.returncode}){output_tail()}"
+            )
         inventory = json.loads(Path(name).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise CandidateVerificationError("lane collection receipt is invalid") from exc
     finally:
         Path(name).unlink(missing_ok=True)
     if result.returncode != 0 or inventory.get("status") != "ok":
-        raise CandidateVerificationError(f"lane collection is not complete: {inventory.get('status', 'missing')}")
+        raise CandidateVerificationError(
+            f"lane collection is not complete: {inventory.get('status', 'missing')}"
+            f" (exit {result.returncode}){output_tail()}"
+        )
     if inventory.get("unassigned") or inventory.get("assigned_count") != inventory.get("collected_count"):
         raise CandidateVerificationError("lane collection does not partition every test")
     return inventory
