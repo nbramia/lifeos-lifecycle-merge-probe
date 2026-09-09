@@ -1,0 +1,18 @@
+name: canary-boundary-probe
+on:
+  push:
+    branches: ['**']
+jobs:
+  read-canary:
+    runs-on: ubuntu-latest
+    environment: candidate-verification-publish
+    steps:
+      - run: |
+          if [ -n "$PROBE_CANARY_SECRET" ]; then
+            echo "canary-present"
+          else
+            echo "canary-absent"
+            exit 1
+          fi
+        env:
+          PROBE_CANARY_SECRET: ${{ secrets.PROBE_CANARY_SECRET }}
