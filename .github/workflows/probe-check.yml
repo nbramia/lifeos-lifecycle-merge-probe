@@ -1,0 +1,19 @@
+name: probe-check
+on:
+  push:
+    branches:
+      - '**'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: run synthetic check
+        run: |
+          if [ -f FAIL_MARKER.txt ]; then
+            echo "synthetic failure marker present"
+            exit 1
+          fi
+          test -f fileA.txt
+          echo "probe check ok"
