@@ -1,0 +1,1 @@
+fileB content (head-only edit, PR branch)
