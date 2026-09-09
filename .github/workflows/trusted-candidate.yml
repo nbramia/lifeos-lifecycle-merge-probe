@@ -28,6 +28,7 @@ jobs:
       - name: Verify exact untrusted candidate with no credentials or secrets
         run: |
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          sleep 20
           test ! -f FAIL_MARKER.txt
 
   publish:
