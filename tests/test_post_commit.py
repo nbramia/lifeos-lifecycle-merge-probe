@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -66,7 +67,12 @@ def test_post_commit_normalizes_timestamp_and_never_restarts(tmp_path: Path):
     author_date = subprocess.run(
         ["git", "log", "-1", "--format=%aI"], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.strip()
-    assert author_date == "2026-01-05T12:00:00+00:00", "timestamp must still be normalized to noon UTC"
+    # git's strict-ISO-8601 %aI rendering of a UTC offset varies by version
+    # ("+00:00" vs. "Z" -- both denote the same instant), so parse it rather
+    # than compare the formatted string.
+    assert datetime.fromisoformat(author_date.replace("Z", "+00:00")) == datetime(
+        2026, 1, 5, 12, 0, 0, tzinfo=timezone.utc
+    ), "timestamp must still be normalized to noon UTC"
 
     assert not (repo / "server-sh-was-called").exists(), (
         "post-commit must never invoke server.sh — restart is deployment-owned"

@@ -26,6 +26,7 @@ bounding-box math both need the real thing.
 import http.server
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,55 @@ def _make_handler(snapshot):
     return handler
 
 
+def _wait_for_graph_at_rest(page: Page, max_wait_ms=8500, interval_ms=150, epsilon=0.5, stable_reads_required=3):
+    """Poll `.node`'s live `transform="translate(x,y)"` positions every
+    `interval_ms` until `stable_reads_required` CONSECUTIVE reads are each
+    within `epsilon` user-space units of the previous one. Raises
+    AssertionError if no such run occurs within `max_wait_ms`.
+    """
+    def positions():
+        return page.evaluate(
+            "() => Array.from(document.querySelectorAll('#graph-svg .node'))"
+            ".map(el => el.getAttribute('transform') || '')"
+        )
+
+    deadline = time.monotonic() + max_wait_ms / 1000.0
+    prev = positions()
+    stable_streak = 0
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(interval_ms)
+        cur = positions()
+        # An empty `cur` (nothing rendered yet) must never count toward the
+        # stable streak -- a zero-length zip() is vacuously stable and
+        # would otherwise settle before a single node has even joined the
+        # DOM.
+        if cur and len(cur) == len(prev) and all(
+            _transform_close(a, b, epsilon) for a, b in zip(prev, cur)
+        ):
+            stable_streak += 1
+            if stable_streak >= stable_reads_required:
+                return
+        else:
+            stable_streak = 0
+        prev = cur
+    raise AssertionError(
+        f"graph did not reach {stable_reads_required} consecutive stable "
+        f"reads within {max_wait_ms}ms ({len(prev)} node(s) on the last read)"
+    )
+
+
+def _transform_close(a, b, epsilon):
+    def parse(t):
+        if not t.startswith("translate(") or not t.endswith(")"):
+            raise ValueError(f"expected a translate(x,y) transform, got {t!r}")
+        x_str, y_str = t[len("translate("):-1].split(",")
+        return float(x_str), float(y_str)
+
+    ax, ay = parse(a)
+    bx, by = parse(b)
+    return abs(ax - bx) <= epsilon and abs(ay - by) <= epsilon
+
+
 def _open_agents(page: Page, base_url, snapshot=None, width=1280, height=800):
     page.set_viewport_size({"width": width, "height": height})
     page.route("**/api/**", _make_handler(snapshot or SNAPSHOT_100))
@@ -143,7 +193,7 @@ def _open_agents(page: Page, base_url, snapshot=None, width=1280, height=800):
     # Let the force simulation settle enough for zoom-to-fit's own bounding
     # box (computed from live node `x`/`y`) to reflect the converged, not
     # still-collapsing-from-center, layout.
-    page.wait_for_timeout(1200)
+    _wait_for_graph_at_rest(page)
 
 
 def _label_display_states(page: Page):
