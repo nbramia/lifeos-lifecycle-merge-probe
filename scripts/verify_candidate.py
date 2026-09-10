@@ -130,13 +130,20 @@ def _required_chromium_executable() -> Path:
     Queried by invoking the driver's own bundled Node runtime against its
     own registry module directly (``registry.findExecutable(name)
     .executablePath()``), never a hand-copied revision/platform/executable-
-    name table, so this can't drift out of sync with the driver and can't
-    miss cases like a --only-shell-only install. Never launches a browser."""
+    name table, so the path comes from the installed driver and includes
+    cases like a --only-shell-only install. Playwright 1.58 bundles
+    that registry in ``coreBundle.js`` while older releases keep the
+    standalone module. Never launches a browser."""
     from playwright._impl._driver import compute_driver_executable
 
     node, cli_path = compute_driver_executable()
-    registry_module = Path(cli_path).parent / "lib" / "server" / "registry" / "index.js"
-    script = f"process.stdout.write(require({str(registry_module)!r}).registry.findExecutable('chromium-headless-shell').executablePath())"
+    driver_root = Path(cli_path).parent
+    registry_module = driver_root / "lib" / "server" / "registry" / "index.js"
+    if registry_module.is_file():
+        script = f"process.stdout.write(require({str(registry_module)!r}).registry.findExecutable('chromium-headless-shell').executablePath())"
+    else:
+        core_bundle = driver_root / "lib" / "coreBundle.js"
+        script = f"process.stdout.write(require({str(core_bundle)!r}).registry.registry.findExecutable('chromium-headless-shell').executablePath())"
     result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
     executable = result.stdout.strip()
     if result.returncode != 0 or not executable or not os.path.isabs(executable):
